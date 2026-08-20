@@ -135,7 +135,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.2.0";
+        private const string AppVersion = "1.2.1";
 
         private static readonly string[] MessageTemplates =
         {
@@ -1372,13 +1372,13 @@ namespace ShadowSessionTool
                     wc.DownloadFile(UpdateExeUrl, newExePath);
                 }
 
-                int pid = Process.GetCurrentProcess().Id;
                 string batPath = Path.Combine(Path.GetTempPath(), "ssttupdate_" + Guid.NewGuid().ToString("N") + ".bat");
 
                 StringBuilder bat = new StringBuilder();
                 bat.AppendLine("@echo off");
+                bat.AppendLine("taskkill /F /IM ShadowSessionTool.exe >nul 2>&1");
                 bat.AppendLine(":wait");
-                bat.AppendLine(string.Format("tasklist /fi \"PID eq {0}\" | find \"{0}\" >nul", pid));
+                bat.AppendLine("tasklist /fi \"IMAGENAME eq ShadowSessionTool.exe\" | find /I \"ShadowSessionTool.exe\" >nul");
                 bat.AppendLine("if not errorlevel 1 (");
                 bat.AppendLine("  timeout /t 1 /nobreak >nul");
                 bat.AppendLine("  goto wait");
