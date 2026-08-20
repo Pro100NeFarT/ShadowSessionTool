@@ -135,7 +135,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.2.1";
+        private const string AppVersion = "1.3.0";
 
         private static readonly string[] MessageTemplates =
         {
@@ -146,6 +146,7 @@ namespace ShadowSessionTool
         private const string UpdateVersionUrl = "https://raw.githubusercontent.com/Pro100NeFarT/ShadowSessionTool/main/version.txt";
         private const string UpdateExeUrl = "https://raw.githubusercontent.com/Pro100NeFarT/ShadowSessionTool/main/ShadowSessionTool.exe";
 
+        private Label lblVersion;
         private Button btnThemeLight;
         private Button btnThemeDark;
         private Button btnThemeBlue;
@@ -205,6 +206,16 @@ namespace ShadowSessionTool
             {
                 // без іконки застосунок все одно працює коректно
             }
+
+            lblVersion = new Label
+            {
+                Text = "v" + AppVersion,
+                AutoSize = true,
+                Location = new Point(12, 12),
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 8F, FontStyle.Underline)
+            };
+            lblVersion.Click += (s, e) => CheckForUpdatesAsync(true);
 
             btnThemeLight = new Button { Text = "Світла", Size = new Size(70, 22), Location = new Point(466, 8), Font = new Font("Segoe UI", 8F) };
             btnThemeLight.Click += (s, e) => ApplyTheme(AppTheme.Light);
@@ -344,6 +355,7 @@ namespace ShadowSessionTool
             lvSessions.ColumnClick += LvSessions_ColumnClick;
             lvSessions.MouseDown += LvSessions_MouseDown;
 
+            Controls.Add(lblVersion);
             Controls.Add(btnThemeLight);
             Controls.Add(btnThemeDark);
             Controls.Add(btnThemeBlue);
@@ -449,9 +461,15 @@ namespace ShadowSessionTool
                 return;
             }
 
+            int? policyValue = GetShadowPolicyValue();
+            bool noConsent = policyValue.HasValue && policyValue.Value == DesiredValue;
+            string args = noConsent
+                ? string.Format("/shadow:{0} /control /noConsentPrompt", id)
+                : string.Format("/shadow:{0} /control", id);
+
             try
             {
-                Process.Start("mstsc.exe", string.Format("/shadow:{0} /control /noConsentPrompt", id));
+                Process.Start("mstsc.exe", args);
             }
             catch (Exception ex)
             {
@@ -1158,6 +1176,7 @@ namespace ShadowSessionTool
             lblSelect.ForeColor = textFore;
             lblStatus.ForeColor = textFore;
             lblHint.ForeColor = hintFore;
+            lblVersion.ForeColor = hintFore;
 
             txtSearch.BackColor = textBoxBack;
             txtSearch.ForeColor = textBoxFore;
@@ -1312,25 +1331,42 @@ namespace ShadowSessionTool
             return result;
         }
 
-        private void CheckForUpdatesAsync()
+        private void CheckForUpdatesAsync(bool manual = false)
         {
             System.Threading.ThreadPool.QueueUserWorkItem(delegate
             {
                 try
                 {
                     string remoteVersion = DownloadString(UpdateVersionUrl).Trim();
-                    Version remote, local;
-                    if (Version.TryParse(remoteVersion, out remote) && Version.TryParse(AppVersion, out local) && remote > local)
+                    Version remote = null, local = null;
+                    bool parsed = Version.TryParse(remoteVersion, out remote) && Version.TryParse(AppVersion, out local);
+
+                    if (parsed && remote > local)
                     {
                         if (IsHandleCreated && !IsDisposed)
                         {
                             BeginInvoke(new Action<string>(PromptUpdate), remoteVersion);
                         }
                     }
+                    else if (manual && IsHandleCreated && !IsDisposed)
+                    {
+                        BeginInvoke(new Action(delegate
+                        {
+                            MessageBox.Show(this, string.Format("У вас найновіша версія ({0}).", AppVersion),
+                                "Перевірка оновлень", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }));
+                    }
                 }
                 catch
                 {
-                    // немає інтернету, репозиторій недоступний тощо - тихо ігноруємо
+                    if (manual && IsHandleCreated && !IsDisposed)
+                    {
+                        BeginInvoke(new Action(delegate
+                        {
+                            MessageBox.Show(this, "Не вдалося перевірити оновлення. Перевірте підключення до інтернету.",
+                                "Перевірка оновлень", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        }));
+                    }
                 }
             });
         }
