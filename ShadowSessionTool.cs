@@ -64,7 +64,8 @@ namespace ShadowSessionTool
 
         internal enum WtsInfoClass
         {
-            WTSUserName = 5
+            WTSUserName = 5,
+            WTSWinStationName = 6
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -134,7 +135,14 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.1.0";
+        private const string AppVersion = "1.2.0";
+
+        private static readonly string[] MessageTemplates =
+        {
+            "Необхідно завершити роботу в 1С/BAS для оновлення.",
+            "Можна працювати.",
+            "Сервер буде перезавантажений через X хвилин."
+        };
         private const string UpdateVersionUrl = "https://raw.githubusercontent.com/Pro100NeFarT/ShadowSessionTool/main/version.txt";
         private const string UpdateExeUrl = "https://raw.githubusercontent.com/Pro100NeFarT/ShadowSessionTool/main/ShadowSessionTool.exe";
 
@@ -147,6 +155,8 @@ namespace ShadowSessionTool
         private Button btnConnect;
         private Button btnDisconnect;
         private Button btnDisconnectAll;
+        private Button btnScheduleReboot;
+        private Button btnCancelReboot;
         private Panel pnlIndicator;
         private Label lblStatus;
         private Button btnEnablePolicy;
@@ -156,6 +166,7 @@ namespace ShadowSessionTool
 
         private ContextMenuStrip ctxMenu;
         private ToolStripMenuItem miCtxConnect;
+        private ToolStripMenuItem miCtxTakeOver;
         private ToolStripMenuItem miCtxDisconnect;
         private ToolStripMenuItem miCtxMessage;
         private ToolStripMenuItem miCtxMessageAll;
@@ -182,8 +193,8 @@ namespace ShadowSessionTool
         {
             Text = "Засіб тіньових сеансів";
             Font = new Font("Segoe UI", 9F);
-            ClientSize = new Size(700, 630);
-            MinimumSize = new Size(660, 550);
+            ClientSize = new Size(700, 674);
+            MinimumSize = new Size(660, 594);
             StartPosition = FormStartPosition.CenterScreen;
 
             try
@@ -270,15 +281,33 @@ namespace ShadowSessionTool
             };
             btnDisconnectAll.Click += BtnDisconnectAll_Click;
 
+            btnScheduleReboot = new Button
+            {
+                Text = "Запланувати перезавантаження",
+                Size = new Size(210, 28),
+                Location = new Point(272, 190)
+            };
+            btnScheduleReboot.Click += BtnScheduleReboot_Click;
+
+            btnCancelReboot = new Button
+            {
+                Text = "Скасувати перезавантаження",
+                Size = new Size(196, 28),
+                Location = new Point(492, 190)
+            };
+            btnCancelReboot.Click += BtnCancelReboot_Click;
+
             txtSearch = new TextBox
             {
-                Location = new Point(12, 188),
+                Location = new Point(12, 228),
                 Size = new Size(170, 23)
             };
             txtSearch.TextChanged += (s, e) => ApplyFilter();
 
             miCtxConnect = new ToolStripMenuItem("Підключитися");
             miCtxConnect.Click += BtnConnect_Click;
+            miCtxTakeOver = new ToolStripMenuItem("Перейняти сеанс (за паролем)");
+            miCtxTakeOver.Click += MiCtxTakeOver_Click;
             miCtxDisconnect = new ToolStripMenuItem("Завершити сеанс");
             miCtxDisconnect.Click += BtnDisconnect_Click;
             miCtxMessage = new ToolStripMenuItem("Надіслати повідомлення");
@@ -288,6 +317,7 @@ namespace ShadowSessionTool
 
             ctxMenu = new ContextMenuStrip();
             ctxMenu.Items.Add(miCtxConnect);
+            ctxMenu.Items.Add(miCtxTakeOver);
             ctxMenu.Items.Add(miCtxDisconnect);
             ctxMenu.Items.Add(new ToolStripSeparator());
             ctxMenu.Items.Add(miCtxMessage);
@@ -300,8 +330,8 @@ namespace ShadowSessionTool
                 FullRowSelect = true,
                 GridLines = true,
                 MultiSelect = true,
-                Location = new Point(12, 218),
-                Size = new Size(676, ClientSize.Height - 218 - 12),
+                Location = new Point(12, 258),
+                Size = new Size(676, ClientSize.Height - 258 - 12),
                 Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
                 ContextMenuStrip = ctxMenu
             };
@@ -326,6 +356,8 @@ namespace ShadowSessionTool
             Controls.Add(lblHint);
             Controls.Add(btnDisconnect);
             Controls.Add(btnDisconnectAll);
+            Controls.Add(btnScheduleReboot);
+            Controls.Add(btnCancelReboot);
             Controls.Add(txtSearch);
             Controls.Add(lvSessions);
         }
@@ -352,6 +384,7 @@ namespace ShadowSessionTool
             int selCount = lvSessions.SelectedItems.Count;
 
             miCtxConnect.Enabled = (selCount == 1) && !IsOwnSessionSelected();
+            miCtxTakeOver.Enabled = (selCount == 1) && !IsOwnSessionSelected();
             miCtxDisconnect.Enabled = (selCount >= 1);
             miCtxDisconnect.Text = selCount > 1
                 ? string.Format("Завершити сеанси ({0})", selCount)
@@ -426,6 +459,87 @@ namespace ShadowSessionTool
             }
         }
 
+        private void MiCtxTakeOver_Click(object sender, EventArgs e)
+        {
+            if (lvSessions.SelectedItems.Count != 1)
+            {
+                MessageBox.Show(this, "Виберіть рівно один сеанс.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            int id;
+            if (!int.TryParse(lvSessions.SelectedItems[0].SubItems[1].Text, out id)) return;
+
+            if (id == _ownSessionId)
+            {
+                MessageBox.Show(this, "Не можна перейняти власний сеанс.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            string userName = lvSessions.SelectedItems[0].Text;
+
+            DialogResult confirm = MessageBox.Show(this,
+                string.Format("Ваш поточний сеанс буде замінено сеансом користувача \"{0}\" (як команда \"Підключити\" в Диспетчері завдань). " +
+                    "Це не тіньовий перегляд — ваш власний робочий стіл стане недоступний, поки ви не повернетесь назад. Продовжити?", userName),
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes) return;
+
+            string password = ShowInputDialog(string.Format("Пароль користувача \"{0}\":", userName), "Перейняти сеанс", true);
+            if (password == null) return;
+
+            string ownStation = GetSessionStationName(_ownSessionId);
+            if (string.IsNullOrEmpty(ownStation))
+            {
+                MessageBox.Show(this, "Не вдалося визначити назву поточного сеансу.", "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("tscon.exe",
+                    string.Format("{0} /dest:{1} /password:{2}", id, ownStation, password))
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    p.WaitForExit(5000);
+                    if (p.ExitCode != 0)
+                    {
+                        string err = p.StandardError.ReadToEnd().Trim();
+                        MessageBox.Show(this,
+                            "Не вдалося перейняти сеанс (код " + p.ExitCode + ")." + (string.IsNullOrEmpty(err) ? "" : "\n" + err),
+                            "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Не вдалося перейняти сеанс: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private string GetSessionStationName(int sessionId)
+        {
+            IntPtr buffer;
+            int bytesReturned;
+            string result = "";
+
+            if (Wts.WTSQuerySessionInformation(IntPtr.Zero, sessionId, Wts.WtsInfoClass.WTSWinStationName, out buffer, out bytesReturned))
+            {
+                if (buffer != IntPtr.Zero)
+                {
+                    result = Marshal.PtrToStringUni(buffer);
+                    Wts.WTSFreeMemory(buffer);
+                }
+            }
+
+            return result;
+        }
+
         private void BtnDisconnect_Click(object sender, EventArgs e)
         {
             if (lvSessions.SelectedItems.Count == 0) return;
@@ -497,6 +611,226 @@ namespace ShadowSessionTool
             }
         }
 
+        private class RebootScheduleResult
+        {
+            public int DelayMinutes;
+            public bool Force;
+        }
+
+        private void BtnScheduleReboot_Click(object sender, EventArgs e)
+        {
+            RebootScheduleResult result = ShowScheduleRebootDialog();
+            if (result == null) return;
+
+            DateTime targetTime = DateTime.Now.AddMinutes(result.DelayMinutes);
+            string message = string.Format("Сервер буде перезавантажений через {0} хв. (орієнтовно о {1}).", result.DelayMinutes, targetTime.ToString("HH:mm"));
+
+            DialogResult confirm = MessageBox.Show(this,
+                string.Format("Заплановано перезавантаження через {0} хв. (о {1}).\nБуде надіслано повідомлення всім активним сеансам:\n\n\"{2}\"\n\nПродовжити?",
+                    result.DelayMinutes, targetTime.ToString("HH:mm"), message),
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes) return;
+
+            List<int> ids = new List<int>();
+            foreach (RdpSession s in _allSessions)
+            {
+                int id;
+                if (int.TryParse(s.Id, out id) && id != _ownSessionId) ids.Add(id);
+            }
+            if (ids.Count > 0) SendMessageToSessions(ids, message);
+
+            try
+            {
+                int seconds = result.DelayMinutes * 60;
+                string args = string.Format("/r /t {0} /c \"{1}\"{2}",
+                    seconds, message.Replace("\"", "'"), result.Force ? " /f" : "");
+
+                ProcessStartInfo psi = new ProcessStartInfo("shutdown.exe", args)
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                Process.Start(psi);
+
+                Text = string.Format("Засіб тіньових сеансів — перезавантаження о {0}", targetTime.ToString("HH:mm"));
+                MessageBox.Show(this, "Перезавантаження заплановано.", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Не вдалося запланувати перезавантаження: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void BtnCancelReboot_Click(object sender, EventArgs e)
+        {
+            DialogResult confirm = MessageBox.Show(this, "Скасувати заплановане перезавантаження сервера?", "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (confirm != DialogResult.Yes) return;
+
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("shutdown.exe", "/a")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    p.WaitForExit(3000);
+                    if (p.ExitCode == 0)
+                    {
+                        Text = "Засіб тіньових сеансів";
+
+                        List<int> ids = new List<int>();
+                        foreach (RdpSession s in _allSessions)
+                        {
+                            int id;
+                            if (int.TryParse(s.Id, out id) && id != _ownSessionId) ids.Add(id);
+                        }
+                        if (ids.Count > 0) SendMessageToSessions(ids, "Заплановане перезавантаження сервера скасовано.");
+
+                        MessageBox.Show(this, "Перезавантаження скасовано.", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                    else
+                    {
+                        MessageBox.Show(this, "Не знайдено запланованого перезавантаження (або не вдалося скасувати).", "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Помилка скасування: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private RebootScheduleResult ShowScheduleRebootDialog()
+        {
+            using (Form dlg = new Form())
+            {
+                dlg.Text = "Запланувати перезавантаження";
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.MinimizeBox = false;
+                dlg.MaximizeBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.ClientSize = new Size(360, 236);
+                dlg.Font = Font;
+                dlg.BackColor = BackColor;
+
+                RadioButton radRelative = new RadioButton
+                {
+                    Text = "Через хвилин:",
+                    Checked = true,
+                    Location = new Point(12, 15),
+                    AutoSize = true,
+                    ForeColor = lblSelect.ForeColor
+                };
+                NumericUpDown numMinutes = new NumericUpDown
+                {
+                    Minimum = 1,
+                    Maximum = 1440,
+                    Value = 15,
+                    Location = new Point(160, 12),
+                    Size = new Size(70, 23)
+                };
+
+                RadioButton radAbsolute = new RadioButton
+                {
+                    Text = "На годину:",
+                    Location = new Point(12, 48),
+                    AutoSize = true,
+                    ForeColor = lblSelect.ForeColor
+                };
+                DateTimePicker dtpTime = new DateTimePicker
+                {
+                    Format = DateTimePickerFormat.Custom,
+                    CustomFormat = "HH:mm",
+                    ShowUpDown = true,
+                    Value = DateTime.Now.AddMinutes(15),
+                    Location = new Point(160, 46),
+                    Size = new Size(80, 23),
+                    Enabled = false
+                };
+
+                radRelative.CheckedChanged += (s, e) =>
+                {
+                    numMinutes.Enabled = radRelative.Checked;
+                    dtpTime.Enabled = !radRelative.Checked;
+                };
+
+                CheckBox chkForce = new CheckBox
+                {
+                    Text = "Примусово закривати програми користувачів",
+                    Location = new Point(12, 84),
+                    AutoSize = true,
+                    MaximumSize = new Size(336, 0),
+                    ForeColor = lblSelect.ForeColor
+                };
+
+                Label lblWarn = new Label
+                {
+                    Text = "Усім активним сеансам (крім вашого) буде надіслано повідомлення з часом перезавантаження.",
+                    ForeColor = Color.DimGray,
+                    Location = new Point(12, 128),
+                    MaximumSize = new Size(336, 0),
+                    AutoSize = true
+                };
+
+                Button ok = new Button
+                {
+                    Text = "Запланувати",
+                    DialogResult = DialogResult.OK,
+                    Location = new Point(172, 196),
+                    Size = new Size(90, 28),
+                    FlatStyle = btnConnect.FlatStyle,
+                    BackColor = btnConnect.BackColor,
+                    ForeColor = btnConnect.ForeColor
+                };
+                ok.FlatAppearance.BorderColor = btnConnect.FlatAppearance.BorderColor;
+
+                Button cancel = new Button
+                {
+                    Text = "Скасувати",
+                    DialogResult = DialogResult.Cancel,
+                    Location = new Point(268, 196),
+                    Size = new Size(90, 28),
+                    FlatStyle = btnConnect.FlatStyle,
+                    BackColor = btnConnect.BackColor,
+                    ForeColor = btnConnect.ForeColor
+                };
+                cancel.FlatAppearance.BorderColor = btnConnect.FlatAppearance.BorderColor;
+
+                dlg.Controls.Add(radRelative);
+                dlg.Controls.Add(numMinutes);
+                dlg.Controls.Add(radAbsolute);
+                dlg.Controls.Add(dtpTime);
+                dlg.Controls.Add(chkForce);
+                dlg.Controls.Add(lblWarn);
+                dlg.Controls.Add(ok);
+                dlg.Controls.Add(cancel);
+                dlg.AcceptButton = ok;
+                dlg.CancelButton = cancel;
+
+                if (dlg.ShowDialog(this) != DialogResult.OK) return null;
+
+                int minutes;
+                if (radRelative.Checked)
+                {
+                    minutes = (int)numMinutes.Value;
+                }
+                else
+                {
+                    DateTime target = DateTime.Today.Add(dtpTime.Value.TimeOfDay);
+                    if (target <= DateTime.Now) target = target.AddDays(1);
+                    minutes = (int)Math.Ceiling((target - DateTime.Now).TotalMinutes);
+                    if (minutes < 1) minutes = 1;
+                }
+
+                return new RebootScheduleResult { DelayMinutes = minutes, Force = chkForce.Checked };
+            }
+        }
+
         private void MiCtxMessage_Click(object sender, EventArgs e)
         {
             if (lvSessions.SelectedItems.Count == 0) return;
@@ -513,7 +847,7 @@ namespace ShadowSessionTool
                 ? "Текст повідомлення:"
                 : string.Format("Текст повідомлення для вибраних сеансів ({0}):", ids.Count);
 
-            string message = ShowInputDialog(prompt, "Надіслати повідомлення");
+            string message = ShowInputDialog(prompt, "Надіслати повідомлення", false, true);
             if (string.IsNullOrEmpty(message)) return;
 
             SendMessageToSessions(ids, message);
@@ -536,7 +870,7 @@ namespace ShadowSessionTool
 
             string message = ShowInputDialog(
                 string.Format("Текст повідомлення для всіх сеансів, крім вашого ({0}):", ids.Count),
-                "Надіслати повідомлення всім");
+                "Надіслати повідомлення всім", false, true);
             if (string.IsNullOrEmpty(message)) return;
 
             SendMessageToSessions(ids, message);
@@ -562,7 +896,7 @@ namespace ShadowSessionTool
             }
         }
 
-        private string ShowInputDialog(string prompt, string title)
+        private string ShowInputDialog(string prompt, string title, bool isPassword = false, bool showTemplates = false)
         {
             using (Form dlg = new Form())
             {
@@ -572,34 +906,65 @@ namespace ShadowSessionTool
                 dlg.MinimizeBox = false;
                 dlg.MaximizeBox = false;
                 dlg.ShowInTaskbar = false;
-                dlg.ClientSize = new Size(400, 168);
                 dlg.Font = Font;
                 dlg.BackColor = BackColor;
+
+                int y = 12;
 
                 Label lbl = new Label
                 {
                     Text = prompt,
                     AutoSize = true,
                     MaximumSize = new Size(376, 0),
-                    Location = new Point(12, 12),
+                    Location = new Point(12, y),
                     ForeColor = lblSelect.ForeColor
                 };
+                y += lbl.PreferredHeight + 6;
 
+                ComboBox cmbTemplate = null;
+                if (showTemplates)
+                {
+                    cmbTemplate = new ComboBox
+                    {
+                        DropDownStyle = ComboBoxStyle.DropDownList,
+                        Location = new Point(12, y),
+                        Size = new Size(376, 23),
+                        BackColor = txtSearch.BackColor,
+                        ForeColor = txtSearch.ForeColor
+                    };
+                    cmbTemplate.Items.Add("(без шаблону)");
+                    foreach (string t in MessageTemplates) cmbTemplate.Items.Add(t);
+                    cmbTemplate.SelectedIndex = 0;
+                    y += 23 + 8;
+                }
+
+                int txtHeight = isPassword ? 23 : 80;
                 TextBox txt = new TextBox
                 {
-                    Multiline = true,
-                    ScrollBars = ScrollBars.Vertical,
-                    Location = new Point(12, 40),
-                    Size = new Size(376, 80),
+                    Multiline = !isPassword,
+                    UseSystemPasswordChar = isPassword,
+                    ScrollBars = isPassword ? ScrollBars.None : ScrollBars.Vertical,
+                    Location = new Point(12, y),
+                    Size = new Size(376, txtHeight),
                     BackColor = txtSearch.BackColor,
                     ForeColor = txtSearch.ForeColor
                 };
+                y += txtHeight + 12;
+
+                if (cmbTemplate != null)
+                {
+                    ComboBox cmbRef = cmbTemplate;
+                    cmbRef.SelectedIndexChanged += (s, e) =>
+                    {
+                        if (cmbRef.SelectedIndex > 0) txt.Text = MessageTemplates[cmbRef.SelectedIndex - 1];
+                    };
+                }
 
                 Button ok = new Button
                 {
-                    Text = "Надіслати",
+                    Text = isPassword ? "OK" : "Надіслати",
                     DialogResult = DialogResult.OK,
-                    Location = new Point(216, 128),
+                    Location = new Point(216, y),
                     Size = new Size(80, 28),
                     FlatStyle = btnConnect.FlatStyle,
                     BackColor = btnConnect.BackColor,
@@ -611,7 +976,7 @@ namespace ShadowSessionTool
                 {
                     Text = "Скасувати",
                     DialogResult = DialogResult.Cancel,
-                    Location = new Point(308, 128),
+                    Location = new Point(308, y),
                     Size = new Size(80, 28),
                     FlatStyle = btnConnect.FlatStyle,
                     BackColor = btnConnect.BackColor,
@@ -619,7 +984,10 @@ namespace ShadowSessionTool
                 };
                 cancel.FlatAppearance.BorderColor = btnConnect.FlatAppearance.BorderColor;
 
+                dlg.ClientSize = new Size(400, y + 28 + 12);
+
                 dlg.Controls.Add(lbl);
+                if (cmbTemplate != null) dlg.Controls.Add(cmbTemplate);
                 dlg.Controls.Add(txt);
                 dlg.Controls.Add(ok);
                 dlg.Controls.Add(cancel);
@@ -797,7 +1165,7 @@ namespace ShadowSessionTool
             lvSessions.BackColor = listBack;
             lvSessions.ForeColor = listFore;
 
-            Button[] buttons = { btnRefresh, btnConnect, btnEnablePolicy, btnDisconnect, btnDisconnectAll, btnThemeLight, btnThemeDark, btnThemeBlue };
+            Button[] buttons = { btnRefresh, btnConnect, btnEnablePolicy, btnDisconnect, btnDisconnectAll, btnScheduleReboot, btnCancelReboot, btnThemeLight, btnThemeDark, btnThemeBlue };
             foreach (Button btn in buttons)
             {
                 btn.FlatStyle = btnStyle;
