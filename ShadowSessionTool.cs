@@ -140,7 +140,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.4.1";
+        private const string AppVersion = "1.4.2";
 
         private static readonly string[] MessageTemplates =
         {
@@ -1483,6 +1483,33 @@ namespace ShadowSessionTool
         {
             _allSessions = GetRdpSessions();
             ApplyFilter();
+            FetchDescriptionsAsync(_allSessions);
+        }
+
+        private void FetchDescriptionsAsync(List<RdpSession> sessions)
+        {
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                Dictionary<string, string> cache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (RdpSession s in sessions)
+                {
+                    string desc;
+                    if (!cache.TryGetValue(s.UserName, out desc))
+                    {
+                        desc = GetUserDescription(s.UserName);
+                        cache[s.UserName] = desc;
+                    }
+                    s.Description = desc;
+                }
+
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        if (_allSessions == sessions) ApplyFilter();
+                    }));
+                }
+            });
         }
 
         private void ApplyFilter()
@@ -1553,7 +1580,6 @@ namespace ShadowSessionTool
             try
             {
                 Dictionary<int, int> oneCCounts = GetOneCCountsBySession();
-                Dictionary<string, string> descriptionCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 int dataSize = Marshal.SizeOf(typeof(Wts.WTS_SESSION_INFO));
                 IntPtr current = pSessionInfo;
 
@@ -1574,13 +1600,6 @@ namespace ShadowSessionTool
                     int oneCCount;
                     oneCCounts.TryGetValue(si.SessionID, out oneCCount);
 
-                    string description;
-                    if (!descriptionCache.TryGetValue(userName, out description))
-                    {
-                        description = GetUserDescription(userName);
-                        descriptionCache[userName] = description;
-                    }
-
                     result.Add(new RdpSession
                     {
                         UserName = userName,
@@ -1589,7 +1608,7 @@ namespace ShadowSessionTool
                         State = TranslateState(si.State),
                         RawState = si.State,
                         OneCCount = oneCCount,
-                        Description = description
+                        Description = ""
                     });
                 }
             }
