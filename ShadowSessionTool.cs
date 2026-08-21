@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.DirectoryServices;
 using System.Drawing;
 using System.IO;
 using System.Net;
@@ -87,6 +88,7 @@ namespace ShadowSessionTool
         public string State;
         public WtsConnectState RawState;
         public int OneCCount;
+        public string Description;
     }
 
     internal class ListViewItemComparer : System.Collections.IComparer
@@ -138,7 +140,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.4.0";
+        private const string AppVersion = "1.4.1";
 
         private static readonly string[] MessageTemplates =
         {
@@ -194,7 +196,7 @@ namespace ShadowSessionTool
             InitializeComponent();
             Shown += (s, e) =>
             {
-                SendMessage(txtSearch.Handle, EM_SETCUEBANNER, IntPtr.Zero, "Пошук за користувачем...");
+                SendMessage(txtSearch.Handle, EM_SETCUEBANNER, IntPtr.Zero, "Пошук за користувачем/описом...");
                 ApplyTheme(LoadSavedTheme());
                 RefreshSessions();
                 RefreshPolicyStatus();
@@ -409,6 +411,7 @@ namespace ShadowSessionTool
             lvSessions.Columns.Add("Стан", 130);
             lvSessions.Columns.Add("Ім'я сеансу", 150);
             lvSessions.Columns.Add("1С/BAS", 90);
+            lvSessions.Columns.Add("Опис", 160);
             lvSessions.DoubleClick += (s, e) => BtnConnect_Click(s, e);
             lvSessions.SelectedIndexChanged += (s, e) => UpdateActionButtons();
             lvSessions.ColumnClick += LvSessions_ColumnClick;
@@ -1489,10 +1492,12 @@ namespace ShadowSessionTool
 
             foreach (RdpSession s in _allSessions)
             {
-                if (!string.IsNullOrEmpty(filter) &&
-                    s.UserName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)
+                if (!string.IsNullOrEmpty(filter))
                 {
-                    continue;
+                    bool matchesUser = s.UserName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool matchesDesc = !string.IsNullOrEmpty(s.Description) &&
+                        s.Description.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (!matchesUser && !matchesDesc) continue;
                 }
 
                 bool isOwn = false;
@@ -1504,6 +1509,7 @@ namespace ShadowSessionTool
                 item.SubItems.Add(s.State);
                 item.SubItems.Add(isOwn ? s.SessionName + " (поточний)" : s.SessionName);
                 item.SubItems.Add(s.OneCCount.ToString());
+                item.SubItems.Add(s.Description);
                 lvSessions.Items.Add(item);
             }
 
@@ -1547,6 +1553,7 @@ namespace ShadowSessionTool
             try
             {
                 Dictionary<int, int> oneCCounts = GetOneCCountsBySession();
+                Dictionary<string, string> descriptionCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 int dataSize = Marshal.SizeOf(typeof(Wts.WTS_SESSION_INFO));
                 IntPtr current = pSessionInfo;
 
@@ -1567,6 +1574,13 @@ namespace ShadowSessionTool
                     int oneCCount;
                     oneCCounts.TryGetValue(si.SessionID, out oneCCount);
 
+                    string description;
+                    if (!descriptionCache.TryGetValue(userName, out description))
+                    {
+                        description = GetUserDescription(userName);
+                        descriptionCache[userName] = description;
+                    }
+
                     result.Add(new RdpSession
                     {
                         UserName = userName,
@@ -1574,7 +1588,8 @@ namespace ShadowSessionTool
                         Id = si.SessionID.ToString(),
                         State = TranslateState(si.State),
                         RawState = si.State,
-                        OneCCount = oneCCount
+                        OneCCount = oneCCount,
+                        Description = description
                     });
                 }
             }
@@ -1602,6 +1617,25 @@ namespace ShadowSessionTool
             }
 
             return result;
+        }
+
+        private static string GetUserDescription(string userName)
+        {
+            int slashIdx = userName.IndexOf('\\');
+            string plainUserName = slashIdx >= 0 ? userName.Substring(slashIdx + 1) : userName;
+
+            try
+            {
+                using (DirectoryEntry entry = new DirectoryEntry("WinNT://" + Environment.MachineName + "/" + plainUserName + ",user"))
+                {
+                    object desc = entry.Properties["Description"].Value;
+                    return desc != null ? desc.ToString() : "";
+                }
+            }
+            catch
+            {
+                return "";
+            }
         }
 
         private static bool Is1CProcess(string processName)
