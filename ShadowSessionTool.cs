@@ -5,6 +5,8 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -84,6 +86,7 @@ namespace ShadowSessionTool
         public string Id;
         public string State;
         public WtsConnectState RawState;
+        public int OneCCount;
     }
 
     internal class ListViewItemComparer : System.Collections.IComparer
@@ -135,7 +138,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.3.0";
+        private const string AppVersion = "1.4.0";
 
         private static readonly string[] MessageTemplates =
         {
@@ -150,25 +153,32 @@ namespace ShadowSessionTool
         private Button btnThemeLight;
         private Button btnThemeDark;
         private Button btnThemeBlue;
+        private ToolTip themeToolTip;
+        private AppTheme _currentTheme = AppTheme.Blue;
 
         private ListView lvSessions;
         private Button btnRefresh;
         private Button btnConnect;
         private Button btnDisconnect;
         private Button btnDisconnectAll;
-        private Button btnScheduleReboot;
-        private Button btnCancelReboot;
+        private Button btnReboot;
+        private ContextMenuStrip rebootMenu;
         private Panel pnlIndicator;
         private Label lblStatus;
         private Button btnEnablePolicy;
         private Label lblHint;
         private Label lblSelect;
         private TextBox txtSearch;
+        private Label lblExternalIpCaption;
+        private Label lblExternalIp;
+        private readonly List<Label> _localIpLabels = new List<Label>();
 
         private ContextMenuStrip ctxMenu;
         private ToolStripMenuItem miCtxConnect;
         private ToolStripMenuItem miCtxTakeOver;
         private ToolStripMenuItem miCtxDisconnect;
+        private ToolStripMenuItem miCtxEnd1C;
+        private ToolStripMenuItem miCtxClearCache1C;
         private ToolStripMenuItem miCtxMessage;
         private ToolStripMenuItem miCtxMessageAll;
 
@@ -176,6 +186,8 @@ namespace ShadowSessionTool
         private int _sortColumn = -1;
         private SortOrder _sortOrder = SortOrder.None;
         private readonly int _ownSessionId = Process.GetCurrentProcess().SessionId;
+        private string _pendingUpdateVersion;
+        private string _externalIp;
 
         public MainForm()
         {
@@ -187,6 +199,8 @@ namespace ShadowSessionTool
                 RefreshSessions();
                 RefreshPolicyStatus();
                 CheckForUpdatesAsync();
+                ShowLocalIp();
+                FetchExternalIpAsync();
             };
         }
 
@@ -215,30 +229,52 @@ namespace ShadowSessionTool
                 Cursor = Cursors.Hand,
                 Font = new Font("Segoe UI", 8F, FontStyle.Underline)
             };
-            lblVersion.Click += (s, e) => CheckForUpdatesAsync(true);
+            lblVersion.Click += (s, e) =>
+            {
+                if (_pendingUpdateVersion != null) PromptUpdate(_pendingUpdateVersion);
+                else CheckForUpdatesAsync(true);
+            };
 
-            btnThemeLight = new Button { Text = "Світла", Size = new Size(70, 22), Location = new Point(466, 8), Font = new Font("Segoe UI", 8F) };
+            themeToolTip = new ToolTip();
+
+            btnThemeLight = new Button { Text = "", Size = new Size(20, 20), Location = new Point(608, 9), BackColor = Color.White, FlatStyle = FlatStyle.Flat };
+            btnThemeLight.FlatAppearance.BorderColor = Color.Gray;
             btnThemeLight.Click += (s, e) => ApplyTheme(AppTheme.Light);
+            themeToolTip.SetToolTip(btnThemeLight, "Світла тема");
 
-            btnThemeDark = new Button { Text = "Темна", Size = new Size(70, 22), Location = new Point(542, 8), Font = new Font("Segoe UI", 8F) };
+            btnThemeDark = new Button { Text = "", Size = new Size(20, 20), Location = new Point(638, 9), BackColor = Color.FromArgb(32, 32, 32), FlatStyle = FlatStyle.Flat };
+            btnThemeDark.FlatAppearance.BorderColor = Color.Gray;
             btnThemeDark.Click += (s, e) => ApplyTheme(AppTheme.Dark);
+            themeToolTip.SetToolTip(btnThemeDark, "Темна тема");
 
-            btnThemeBlue = new Button { Text = "Синя", Size = new Size(70, 22), Location = new Point(618, 8), Font = new Font("Segoe UI", 8F) };
+            btnThemeBlue = new Button { Text = "", Size = new Size(20, 20), Location = new Point(668, 9), BackColor = Color.FromArgb(70, 130, 220), FlatStyle = FlatStyle.Flat };
+            btnThemeBlue.FlatAppearance.BorderColor = Color.Gray;
             btnThemeBlue.Click += (s, e) => ApplyTheme(AppTheme.Blue);
+            themeToolTip.SetToolTip(btnThemeBlue, "Синя тема");
 
             lblSelect = new Label
             {
                 Text = "Виберіть сеанс для підключення:",
                 AutoSize = true,
+                MaximumSize = new Size(140, 0),
                 Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-                Location = new Point(12, 45)
+                Location = new Point(12, 35)
             };
 
-            btnRefresh = new Button { Text = "Оновити", Size = new Size(110, 28), Location = new Point(438, 40) };
+            const int btnW = 165, btnH = 28, colA = 173, colB = 348, colRight = 523;
+
+            btnRefresh = new Button { Text = "Оновити", Size = new Size(btnW, btnH), Location = new Point(colA, 40) };
             btnRefresh.Click += (s, e) => { RefreshSessions(); RefreshPolicyStatus(); };
 
-            btnConnect = new Button { Text = "Підключитися", Size = new Size(130, 28), Location = new Point(558, 40), Enabled = false };
+            btnConnect = new Button { Text = "Підключитися", Size = new Size(btnW, btnH), Location = new Point(colB, 40), Enabled = false };
             btnConnect.Click += BtnConnect_Click;
+
+            btnReboot = new Button
+            {
+                Text = "Перезавантаження ▾",
+                Size = new Size(btnW, btnH),
+                Location = new Point(colRight, 40)
+            };
 
             pnlIndicator = new Panel
             {
@@ -251,7 +287,7 @@ namespace ShadowSessionTool
             lblStatus = new Label
             {
                 AutoSize = true,
-                MaximumSize = new Size(480, 0),
+                MaximumSize = new Size(470, 0),
                 Location = new Point(36, 78),
                 Text = "Перевірка..."
             };
@@ -259,8 +295,8 @@ namespace ShadowSessionTool
             btnEnablePolicy = new Button
             {
                 Text = "Увімкнути дозвіл",
-                Size = new Size(160, 28),
-                Location = new Point(528, 74),
+                Size = new Size(btnW, btnH),
+                Location = new Point(colRight, 74),
                 Anchor = AnchorStyles.Top | AnchorStyles.Right,
                 Visible = false
             };
@@ -278,8 +314,8 @@ namespace ShadowSessionTool
             btnDisconnect = new Button
             {
                 Text = "Завершити сеанс",
-                Size = new Size(140, 28),
-                Location = new Point(272, 152),
+                Size = new Size(btnW, btnH),
+                Location = new Point(272, 225),
                 Enabled = false
             };
             btnDisconnect.Click += BtnDisconnect_Click;
@@ -287,26 +323,42 @@ namespace ShadowSessionTool
             btnDisconnectAll = new Button
             {
                 Text = "Завершити відключені",
-                Size = new Size(190, 28),
-                Location = new Point(420, 152)
+                Size = new Size(btnW, btnH),
+                Location = new Point(447, 225)
             };
             btnDisconnectAll.Click += BtnDisconnectAll_Click;
 
-            btnScheduleReboot = new Button
+            lblExternalIpCaption = new Label
             {
-                Text = "Запланувати перезавантаження",
-                Size = new Size(210, 28),
-                Location = new Point(272, 190)
+                AutoSize = true,
+                Font = new Font("Segoe UI", 8F),
+                Location = new Point(145, 152),
+                Text = "Зовнішній IP:"
             };
-            btnScheduleReboot.Click += BtnScheduleReboot_Click;
 
-            btnCancelReboot = new Button
+            lblExternalIp = new Label
             {
-                Text = "Скасувати перезавантаження",
-                Size = new Size(196, 28),
-                Location = new Point(492, 190)
+                AutoSize = true,
+                Font = new Font("Segoe UI", 8F),
+                Cursor = Cursors.Hand,
+                Location = new Point(145, 168),
+                Text = "..."
             };
-            btnCancelReboot.Click += BtnCancelReboot_Click;
+            lblExternalIp.Click += (s, e) =>
+            {
+                if (!string.IsNullOrEmpty(_externalIp)) CopyToClipboard(_externalIp);
+            };
+
+            ToolStripMenuItem miRebootSchedule = new ToolStripMenuItem("Запланувати...");
+            miRebootSchedule.Click += BtnScheduleReboot_Click;
+            ToolStripMenuItem miRebootCancel = new ToolStripMenuItem("Скасувати");
+            miRebootCancel.Click += BtnCancelReboot_Click;
+
+            rebootMenu = new ContextMenuStrip();
+            rebootMenu.Items.Add(miRebootSchedule);
+            rebootMenu.Items.Add(miRebootCancel);
+
+            btnReboot.Click += (s, e) => rebootMenu.Show(btnReboot, new Point(0, btnReboot.Height));
 
             txtSearch = new TextBox
             {
@@ -321,6 +373,10 @@ namespace ShadowSessionTool
             miCtxTakeOver.Click += MiCtxTakeOver_Click;
             miCtxDisconnect = new ToolStripMenuItem("Завершити сеанс");
             miCtxDisconnect.Click += BtnDisconnect_Click;
+            miCtxEnd1C = new ToolStripMenuItem("Завершити 1С/BAS");
+            miCtxEnd1C.Click += MiCtxEnd1C_Click;
+            miCtxClearCache1C = new ToolStripMenuItem("Очистити кеш 1С/BAS");
+            miCtxClearCache1C.Click += MiCtxClearCache1C_Click;
             miCtxMessage = new ToolStripMenuItem("Надіслати повідомлення");
             miCtxMessage.Click += MiCtxMessage_Click;
             miCtxMessageAll = new ToolStripMenuItem("Надіслати повідомлення всім");
@@ -330,6 +386,8 @@ namespace ShadowSessionTool
             ctxMenu.Items.Add(miCtxConnect);
             ctxMenu.Items.Add(miCtxTakeOver);
             ctxMenu.Items.Add(miCtxDisconnect);
+            ctxMenu.Items.Add(miCtxEnd1C);
+            ctxMenu.Items.Add(miCtxClearCache1C);
             ctxMenu.Items.Add(new ToolStripSeparator());
             ctxMenu.Items.Add(miCtxMessage);
             ctxMenu.Items.Add(miCtxMessageAll);
@@ -350,6 +408,7 @@ namespace ShadowSessionTool
             lvSessions.Columns.Add("ID сеансу", 90);
             lvSessions.Columns.Add("Стан", 130);
             lvSessions.Columns.Add("Ім'я сеансу", 150);
+            lvSessions.Columns.Add("1С/BAS", 90);
             lvSessions.DoubleClick += (s, e) => BtnConnect_Click(s, e);
             lvSessions.SelectedIndexChanged += (s, e) => UpdateActionButtons();
             lvSessions.ColumnClick += LvSessions_ColumnClick;
@@ -368,8 +427,9 @@ namespace ShadowSessionTool
             Controls.Add(lblHint);
             Controls.Add(btnDisconnect);
             Controls.Add(btnDisconnectAll);
-            Controls.Add(btnScheduleReboot);
-            Controls.Add(btnCancelReboot);
+            Controls.Add(lblExternalIpCaption);
+            Controls.Add(lblExternalIp);
+            Controls.Add(btnReboot);
             Controls.Add(txtSearch);
             Controls.Add(lvSessions);
         }
@@ -406,6 +466,19 @@ namespace ShadowSessionTool
             miCtxMessage.Text = selCount > 1
                 ? string.Format("Надіслати повідомлення ({0})", selCount)
                 : "Надіслати повідомлення";
+
+            int oneCTotal = 0;
+            foreach (ListViewItem item in lvSessions.SelectedItems)
+            {
+                int c;
+                if (int.TryParse(item.SubItems[4].Text, out c)) oneCTotal += c;
+            }
+            miCtxEnd1C.Enabled = oneCTotal > 0;
+            miCtxEnd1C.Text = oneCTotal > 0
+                ? string.Format("Завершити 1С/BAS ({0})", oneCTotal)
+                : "Завершити 1С/BAS";
+
+            miCtxClearCache1C.Enabled = (selCount >= 1);
         }
 
         private void LvSessions_ColumnClick(object sender, ColumnClickEventArgs e)
@@ -626,6 +699,175 @@ namespace ShadowSessionTool
             if (failed.Count > 0)
             {
                 MessageBox.Show(this, "Не вдалося завершити сеанс(и) з ID: " + string.Join(", ", failed.ToArray()), "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private static List<Process> GetOneCProcessesForSessions(List<int> sessionIds)
+        {
+            List<Process> processes = new List<Process>();
+            foreach (Process p in Process.GetProcesses())
+            {
+                try
+                {
+                    if (Is1CProcess(p.ProcessName) && sessionIds.Contains(p.SessionId)) processes.Add(p);
+                }
+                catch
+                {
+                    // процес міг завершитись між переліком і зверненням до нього
+                }
+            }
+            return processes;
+        }
+
+        private static List<string> KillProcesses(List<Process> processes)
+        {
+            List<string> failed = new List<string>();
+            foreach (Process p in processes)
+            {
+                try
+                {
+                    p.Kill();
+                }
+                catch (Exception ex)
+                {
+                    failed.Add(p.Id + " (" + ex.Message + ")");
+                }
+            }
+            return failed;
+        }
+
+        private void MiCtxEnd1C_Click(object sender, EventArgs e)
+        {
+            if (lvSessions.SelectedItems.Count == 0) return;
+
+            List<int> ids = new List<int>();
+            foreach (ListViewItem item in lvSessions.SelectedItems)
+            {
+                int id;
+                if (int.TryParse(item.SubItems[1].Text, out id)) ids.Add(id);
+            }
+            if (ids.Count == 0) return;
+
+            List<Process> processes = GetOneCProcessesForSessions(ids);
+
+            if (processes.Count == 0)
+            {
+                MessageBox.Show(this, "У вибраних сеансах немає запущених процесів 1С/BAS.", "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            DialogResult confirm = MessageBox.Show(this,
+                string.Format("Завершити {0} процес(и) 1С/BAS у вибраних сеансах? Незбережені дані користувачів буде втрачено.", processes.Count),
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes) return;
+
+            List<string> failed = KillProcesses(processes);
+
+            if (failed.Count > 0)
+            {
+                MessageBox.Show(this, "Не вдалося завершити процес(и): " + string.Join(", ", failed.ToArray()), "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+
+            RefreshSessions();
+        }
+
+        private void MiCtxClearCache1C_Click(object sender, EventArgs e)
+        {
+            if (lvSessions.SelectedItems.Count == 0) return;
+
+            List<int> ids = new List<int>();
+            List<string> userNames = new List<string>();
+            foreach (ListViewItem item in lvSessions.SelectedItems)
+            {
+                int id;
+                if (int.TryParse(item.SubItems[1].Text, out id))
+                {
+                    ids.Add(id);
+                    userNames.Add(item.Text);
+                }
+            }
+            if (ids.Count == 0) return;
+
+            DialogResult confirm = MessageBox.Show(this,
+                string.Format(
+                    "Для {0} буде виконано:\n" +
+                    "1. Завершення процесів 1С/BAS\n" +
+                    "2. Очищення кешу 1С (Config, ConfigSave, DBNameCache, SICache, vrs-cache) — інформаційні бази й налаштування обладнання не зачіпаються\n" +
+                    "3. Повідомлення \"Можна працювати\"\n\nПродовжити?",
+                    string.Join(", ", userNames.ToArray())),
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes) return;
+
+            List<Process> processes = GetOneCProcessesForSessions(ids);
+            List<string> failedKill = KillProcesses(processes);
+            if (processes.Count > 0) System.Threading.Thread.Sleep(1500);
+
+            List<string> cacheErrors = new List<string>();
+            foreach (string userName in userNames)
+            {
+                try
+                {
+                    ClearOneCCache(userName);
+                }
+                catch (Exception ex)
+                {
+                    cacheErrors.Add(userName + ": " + ex.Message);
+                }
+            }
+
+            SendMessageToSessions(ids, "Можна працювати.");
+            RefreshSessions();
+
+            if (failedKill.Count > 0 || cacheErrors.Count > 0)
+            {
+                StringBuilder msg = new StringBuilder();
+                if (failedKill.Count > 0) msg.AppendLine("Не вдалося завершити процес(и): " + string.Join(", ", failedKill.ToArray()));
+                if (cacheErrors.Count > 0) msg.AppendLine("Помилки очищення кешу: " + string.Join("; ", cacheErrors.ToArray()));
+                MessageBox.Show(this, msg.ToString(), "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            else
+            {
+                MessageBox.Show(this, "Готово: сеанси 1С завершено, кеш очищено, користувачів повідомлено.", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        private static readonly string[] OneCVersionFolders = { "1Cv8", "1Cv82" };
+        private static readonly string[] OneCCacheFoldersToDelete = { "Config", "ConfigSave", "DBNameCache", "SICache", "vrs-cache" };
+
+        private static void ClearOneCCache(string userName)
+        {
+            int slashIdx = userName.IndexOf('\\');
+            string plainUserName = slashIdx >= 0 ? userName.Substring(slashIdx + 1) : userName;
+
+            string systemDrive = Environment.GetEnvironmentVariable("SystemDrive") + "\\";
+            string profileRoot = Path.Combine(systemDrive, "Users", plainUserName);
+
+            string[] roots =
+            {
+                Path.Combine(profileRoot, "AppData", "Local", "1C"),
+                Path.Combine(profileRoot, "AppData", "Roaming", "1C")
+            };
+
+            foreach (string root in roots)
+            {
+                foreach (string verFolder in OneCVersionFolders)
+                {
+                    string versionPath = Path.Combine(root, verFolder);
+                    if (!Directory.Exists(versionPath)) continue;
+
+                    foreach (string dbDir in Directory.GetDirectories(versionPath))
+                    {
+                        foreach (string cacheFolder in OneCCacheFoldersToDelete)
+                        {
+                            string target = Path.Combine(dbDir, cacheFolder);
+                            if (Directory.Exists(target))
+                            {
+                                try { Directory.Delete(target, true); }
+                                catch { /* пропускаємо окрему теку, якщо вона зайнята */ }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1103,7 +1345,7 @@ namespace ShadowSessionTool
             {
                 // ігноруємо, застосуємо тему за замовчуванням
             }
-            return AppTheme.Light;
+            return AppTheme.Blue;
         }
 
         private void SaveTheme(AppTheme theme)
@@ -1176,7 +1418,10 @@ namespace ShadowSessionTool
             lblSelect.ForeColor = textFore;
             lblStatus.ForeColor = textFore;
             lblHint.ForeColor = hintFore;
-            lblVersion.ForeColor = hintFore;
+            if (_pendingUpdateVersion == null) lblVersion.ForeColor = hintFore;
+            lblExternalIpCaption.ForeColor = hintFore;
+            lblExternalIp.ForeColor = hintFore;
+            foreach (Label lbl in _localIpLabels) lbl.ForeColor = hintFore;
 
             txtSearch.BackColor = textBoxBack;
             txtSearch.ForeColor = textBoxFore;
@@ -1184,7 +1429,7 @@ namespace ShadowSessionTool
             lvSessions.BackColor = listBack;
             lvSessions.ForeColor = listFore;
 
-            Button[] buttons = { btnRefresh, btnConnect, btnEnablePolicy, btnDisconnect, btnDisconnectAll, btnScheduleReboot, btnCancelReboot, btnThemeLight, btnThemeDark, btnThemeBlue };
+            Button[] buttons = { btnRefresh, btnConnect, btnEnablePolicy, btnDisconnect, btnDisconnectAll, btnReboot };
             foreach (Button btn in buttons)
             {
                 btn.FlatStyle = btnStyle;
@@ -1193,9 +1438,11 @@ namespace ShadowSessionTool
                 btn.FlatAppearance.BorderColor = btnBorder;
             }
 
-            btnThemeLight.Font = new Font(btnThemeLight.Font, theme == AppTheme.Light ? FontStyle.Bold : FontStyle.Regular);
-            btnThemeDark.Font = new Font(btnThemeDark.Font, theme == AppTheme.Dark ? FontStyle.Bold : FontStyle.Regular);
-            btnThemeBlue.Font = new Font(btnThemeBlue.Font, theme == AppTheme.Blue ? FontStyle.Bold : FontStyle.Regular);
+            SetThemeSwatchActive(btnThemeLight, theme == AppTheme.Light, Color.Black);
+            SetThemeSwatchActive(btnThemeDark, theme == AppTheme.Dark, Color.White);
+            SetThemeSwatchActive(btnThemeBlue, theme == AppTheme.Blue, Color.Black);
+
+            _currentTheme = theme;
 
             try
             {
@@ -1207,6 +1454,26 @@ namespace ShadowSessionTool
             }
 
             SaveTheme(theme);
+        }
+
+        private static void SetThemeSwatchActive(Button btn, bool active, Color activeBorderColor)
+        {
+            btn.FlatAppearance.BorderSize = active ? 3 : 1;
+            btn.FlatAppearance.BorderColor = active ? activeBorderColor : Color.Gray;
+        }
+
+        private static void CopyToClipboard(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return;
+
+            try
+            {
+                Clipboard.SetText(value);
+            }
+            catch
+            {
+                // буфер обміну міг бути зайнятий іншим процесом - не критично
+            }
         }
 
         private void RefreshSessions()
@@ -1236,6 +1503,7 @@ namespace ShadowSessionTool
                 item.SubItems.Add(s.Id);
                 item.SubItems.Add(s.State);
                 item.SubItems.Add(isOwn ? s.SessionName + " (поточний)" : s.SessionName);
+                item.SubItems.Add(s.OneCCount.ToString());
                 lvSessions.Items.Add(item);
             }
 
@@ -1278,6 +1546,7 @@ namespace ShadowSessionTool
 
             try
             {
+                Dictionary<int, int> oneCCounts = GetOneCCountsBySession();
                 int dataSize = Marshal.SizeOf(typeof(Wts.WTS_SESSION_INFO));
                 IntPtr current = pSessionInfo;
 
@@ -1295,13 +1564,17 @@ namespace ShadowSessionTool
                         ? Marshal.PtrToStringUni(si.pWinStationName)
                         : "";
 
+                    int oneCCount;
+                    oneCCounts.TryGetValue(si.SessionID, out oneCCount);
+
                     result.Add(new RdpSession
                     {
                         UserName = userName,
                         SessionName = stationName,
                         Id = si.SessionID.ToString(),
                         State = TranslateState(si.State),
-                        RawState = si.State
+                        RawState = si.State,
+                        OneCCount = oneCCount
                     });
                 }
             }
@@ -1331,6 +1604,34 @@ namespace ShadowSessionTool
             return result;
         }
 
+        private static bool Is1CProcess(string processName)
+        {
+            return processName.StartsWith("1cv8", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static Dictionary<int, int> GetOneCCountsBySession()
+        {
+            Dictionary<int, int> counts = new Dictionary<int, int>();
+
+            foreach (Process p in Process.GetProcesses())
+            {
+                try
+                {
+                    if (!Is1CProcess(p.ProcessName)) continue;
+
+                    int sessionCount;
+                    counts.TryGetValue(p.SessionId, out sessionCount);
+                    counts[p.SessionId] = sessionCount + 1;
+                }
+                catch
+                {
+                    // процес міг завершитись між переліком і зверненням до нього
+                }
+            }
+
+            return counts;
+        }
+
         private void CheckForUpdatesAsync(bool manual = false)
         {
             System.Threading.ThreadPool.QueueUserWorkItem(delegate
@@ -1345,7 +1646,14 @@ namespace ShadowSessionTool
                     {
                         if (IsHandleCreated && !IsDisposed)
                         {
-                            BeginInvoke(new Action<string>(PromptUpdate), remoteVersion);
+                            if (manual)
+                            {
+                                BeginInvoke(new Action<string>(PromptUpdate), remoteVersion);
+                            }
+                            else
+                            {
+                                BeginInvoke(new Action<string>(MarkUpdateAvailable), remoteVersion);
+                            }
                         }
                     }
                     else if (manual && IsHandleCreated && !IsDisposed)
@@ -1391,6 +1699,116 @@ namespace ShadowSessionTool
             {
                 PerformUpdate();
             }
+        }
+
+        private void MarkUpdateAvailable(string newVersion)
+        {
+            _pendingUpdateVersion = newVersion;
+            lblVersion.Text = string.Format("v{0} ↑", AppVersion);
+            lblVersion.ForeColor = Color.OrangeRed;
+        }
+
+        private void ShowLocalIp()
+        {
+            List<string> addresses = new List<string>();
+
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+
+                    foreach (UnicastIPAddressInformation addr in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (addr.Address.AddressFamily == AddressFamily.InterNetwork)
+                        {
+                            addresses.Add(addr.Address.ToString());
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // не критично, просто не покажемо локальні адреси
+            }
+
+            foreach (Label old in _localIpLabels) Controls.Remove(old);
+            _localIpLabels.Clear();
+
+            Font ipFont = new Font("Segoe UI", 8F);
+            int y = 152;
+
+            Label caption = new Label
+            {
+                AutoSize = true,
+                Font = ipFont,
+                Location = new Point(12, y),
+                Text = "Локальний IP:",
+                ForeColor = lblHint.ForeColor
+            };
+            Controls.Add(caption);
+            _localIpLabels.Add(caption);
+            y += caption.PreferredHeight;
+
+            if (addresses.Count == 0)
+            {
+                Label none = new Label
+                {
+                    AutoSize = true,
+                    Font = ipFont,
+                    Location = new Point(12, y),
+                    Text = "невідомо",
+                    ForeColor = lblHint.ForeColor
+                };
+                Controls.Add(none);
+                _localIpLabels.Add(none);
+            }
+            else
+            {
+                foreach (string addr in addresses)
+                {
+                    string captured = addr;
+                    Label lbl = new Label
+                    {
+                        AutoSize = true,
+                        Font = ipFont,
+                        Cursor = Cursors.Hand,
+                        Location = new Point(12, y),
+                        Text = addr,
+                        ForeColor = lblHint.ForeColor
+                    };
+                    lbl.Click += (s, e) => CopyToClipboard(captured);
+                    Controls.Add(lbl);
+                    _localIpLabels.Add(lbl);
+                    y += lbl.PreferredHeight;
+                }
+            }
+        }
+
+        private void FetchExternalIpAsync()
+        {
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                string ip = null;
+                try
+                {
+                    ip = DownloadString("https://api.ipify.org").Trim();
+                }
+                catch
+                {
+                    // немає інтернету або сервіс недоступний
+                }
+
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        _externalIp = ip;
+                        lblExternalIp.Text = string.IsNullOrEmpty(ip) ? "недоступно" : ip;
+                    }));
+                }
+            });
         }
 
         private void PerformUpdate()
