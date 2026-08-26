@@ -9,6 +9,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.ServiceProcess;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
@@ -19,8 +20,14 @@ namespace ShadowSessionTool
     internal static class Program
     {
         [STAThread]
-        private static void Main()
+        private static void Main(string[] args)
         {
+            if (args.Length > 0 && string.Equals(args[0], ServerCacheCleanup.AutoRunArg, StringComparison.OrdinalIgnoreCase))
+            {
+                ServerCacheCleanup.Run(true);
+                return;
+            }
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
@@ -125,6 +132,171 @@ namespace ShadowSessionTool
         }
     }
 
+    internal static class ServerCacheCleanup
+    {
+        internal const string TaskName = "ShadowSessionTool_CleanServerCache1C";
+        internal const string AutoRunArg = "/autoclean1c";
+
+        private static readonly string[] ServiceNames =
+        {
+            "1C:Enterprise 8.3 Server Agent (x86-64)",
+            "BAF Server Agent (x86-64)"
+        };
+
+        private static readonly Dictionary<string, string> ServiceSrvInfoPaths = new Dictionary<string, string>
+        {
+            { "1C:Enterprise 8.3 Server Agent (x86-64)", @"C:\Program Files\1cv8\srvinfo" },
+            { "BAF Server Agent (x86-64)", @"C:\Program Files\BAF\srvinfo" }
+        };
+
+        private static readonly Regex GuidRegex = new Regex(
+            "^[a-f0-9]{8}-([a-f0-9]{4}-){3}[a-f0-9]{12}$", RegexOptions.IgnoreCase);
+
+        internal class CleanupResult
+        {
+            public readonly List<string> ServicesProcessed = new List<string>();
+            public readonly List<string> FoldersDeleted = new List<string>();
+            public readonly List<string> Errors = new List<string>();
+        }
+
+        internal static CleanupResult Run(bool writeLog)
+        {
+            CleanupResult result = new CleanupResult();
+            List<string> stoppedServices = new List<string>();
+
+            foreach (string svcName in ServiceNames)
+            {
+                ServiceController sc = TryGetService(svcName);
+                if (sc == null) continue; // служба не встановлена на цьому сервері
+
+                try
+                {
+                    sc.Refresh();
+                    if (sc.Status != ServiceControllerStatus.Running)
+                    {
+                        // встановлена, але зараз не запущена - не чіпаємо й не запускаємо її потім
+                        continue;
+                    }
+
+                    sc.Stop();
+                    sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+                    stoppedServices.Add(svcName);
+                    result.ServicesProcessed.Add(svcName + ": зупинено");
+                }
+                catch (Exception ex)
+                {
+                    result.Errors.Add("Не вдалося зупинити службу \"" + svcName + "\": " + ex.Message);
+                }
+            }
+
+            if (stoppedServices.Count == 0)
+            {
+                result.Errors.Add("Жодна відома служба 1С/BAF наразі не запущена на цьому сервері.");
+                if (writeLog) WriteLog(result, stoppedServices);
+                return result;
+            }
+
+            System.Threading.Thread.Sleep(7000);
+
+            foreach (string svcName in stoppedServices)
+            {
+                string root;
+                if (!ServiceSrvInfoPaths.TryGetValue(svcName, out root)) continue;
+                if (!Directory.Exists(root)) continue;
+
+                try
+                {
+                    string[] allDirs = Directory.GetDirectories(root, "*", SearchOption.AllDirectories);
+                    foreach (string dir in allDirs)
+                    {
+                        string name = Path.GetFileName(dir);
+                        bool matches = GuidRegex.IsMatch(name) ||
+                            name.StartsWith("snccnt", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(name, "STT", StringComparison.OrdinalIgnoreCase);
+                        if (!matches) continue;
+                        if (!Directory.Exists(dir)) continue;
+
+                        try
+                        {
+                            Directory.Delete(dir, true);
+                            result.FoldersDeleted.Add(dir);
+                        }
+                        catch (Exception ex)
+                        {
+                            result.Errors.Add("Не вдалося видалити \"" + dir + "\": " + ex.Message);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    result.Errors.Add("Помилка обходу \"" + root + "\": " + ex.Message);
+                }
+            }
+
+            foreach (string svcName in stoppedServices)
+            {
+                ServiceController sc = TryGetService(svcName);
+                if (sc == null) continue;
+
+                try
+                {
+                    sc.Refresh();
+                    if (sc.Status != ServiceControllerStatus.Running)
+                    {
+                        sc.Start();
+                        sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(60));
+                    }
+                    result.ServicesProcessed.Add(svcName + ": запущено");
+                }
+                catch (Exception ex)
+                {
+                    result.Errors.Add("Не вдалося запустити службу \"" + svcName + "\": " + ex.Message);
+                }
+            }
+
+            if (writeLog) WriteLog(result, stoppedServices);
+            return result;
+        }
+
+        private static ServiceController TryGetService(string name)
+        {
+            try
+            {
+                ServiceController sc = new ServiceController(name);
+                ServiceControllerStatus probe = sc.Status;
+                return sc;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static void WriteLog(CleanupResult result, List<string> stoppedServices)
+        {
+            try
+            {
+                string dir = @"C:\Scripts\1C_Maintenance\Logs";
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                string file = Path.Combine(dir, "Cleanup_" + DateTime.Now.ToString("yyyyMMdd") + ".log");
+
+                string ts = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine(ts + " [INFO] Запущено ShadowSessionTool: очищення серверного кешу 1С/BAF");
+                foreach (string s in result.ServicesProcessed) sb.AppendLine(ts + " [INFO] " + s);
+                foreach (string f in result.FoldersDeleted) sb.AppendLine(ts + " [INFO] Видалено: " + f);
+                foreach (string e in result.Errors) sb.AppendLine(ts + " [ERROR] " + e);
+                sb.AppendLine(ts + " [INFO] Завершено");
+
+                File.AppendAllText(file, sb.ToString(), Encoding.UTF8);
+            }
+            catch
+            {
+                // логування не критичне
+            }
+        }
+    }
+
     internal class MainForm : Form
     {
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -140,7 +312,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.4.2";
+        private const string AppVersion = "1.5.0";
 
         private static readonly string[] MessageTemplates =
         {
@@ -160,11 +332,12 @@ namespace ShadowSessionTool
 
         private ListView lvSessions;
         private Button btnRefresh;
-        private Button btnConnect;
         private Button btnDisconnect;
         private Button btnDisconnectAll;
         private Button btnReboot;
         private ContextMenuStrip rebootMenu;
+        private Button btnServerCache;
+        private ContextMenuStrip serverCacheMenu;
         private Panel pnlIndicator;
         private Label lblStatus;
         private Button btnEnablePolicy;
@@ -185,6 +358,7 @@ namespace ShadowSessionTool
         private ToolStripMenuItem miCtxMessageAll;
 
         private List<RdpSession> _allSessions = new List<RdpSession>();
+        private readonly Dictionary<string, string> _descriptionCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private int _sortColumn = -1;
         private SortOrder _sortOrder = SortOrder.None;
         private readonly int _ownSessionId = Process.GetCurrentProcess().SessionId;
@@ -194,6 +368,15 @@ namespace ShadowSessionTool
         public MainForm()
         {
             InitializeComponent();
+            KeyPreview = true;
+            KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.F5)
+                {
+                    RefreshSessions();
+                    RefreshPolicyStatus();
+                }
+            };
             Shown += (s, e) =>
             {
                 SendMessage(txtSearch.Handle, EM_SETCUEBANNER, IntPtr.Zero, "Пошук за користувачем/описом...");
@@ -239,17 +422,17 @@ namespace ShadowSessionTool
 
             themeToolTip = new ToolTip();
 
-            btnThemeLight = new Button { Text = "", Size = new Size(20, 20), Location = new Point(608, 9), BackColor = Color.White, FlatStyle = FlatStyle.Flat };
+            btnThemeLight = new Button { Text = "", Size = new Size(20, 20), Location = new Point(608, 9), BackColor = Color.White, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right };
             btnThemeLight.FlatAppearance.BorderColor = Color.Gray;
             btnThemeLight.Click += (s, e) => ApplyTheme(AppTheme.Light);
             themeToolTip.SetToolTip(btnThemeLight, "Світла тема");
 
-            btnThemeDark = new Button { Text = "", Size = new Size(20, 20), Location = new Point(638, 9), BackColor = Color.FromArgb(32, 32, 32), FlatStyle = FlatStyle.Flat };
+            btnThemeDark = new Button { Text = "", Size = new Size(20, 20), Location = new Point(638, 9), BackColor = Color.FromArgb(32, 32, 32), FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right };
             btnThemeDark.FlatAppearance.BorderColor = Color.Gray;
             btnThemeDark.Click += (s, e) => ApplyTheme(AppTheme.Dark);
             themeToolTip.SetToolTip(btnThemeDark, "Темна тема");
 
-            btnThemeBlue = new Button { Text = "", Size = new Size(20, 20), Location = new Point(668, 9), BackColor = Color.FromArgb(70, 130, 220), FlatStyle = FlatStyle.Flat };
+            btnThemeBlue = new Button { Text = "", Size = new Size(20, 20), Location = new Point(668, 9), BackColor = Color.FromArgb(70, 130, 220), FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right };
             btnThemeBlue.FlatAppearance.BorderColor = Color.Gray;
             btnThemeBlue.Click += (s, e) => ApplyTheme(AppTheme.Blue);
             themeToolTip.SetToolTip(btnThemeBlue, "Синя тема");
@@ -263,19 +446,41 @@ namespace ShadowSessionTool
                 Location = new Point(12, 35)
             };
 
-            const int btnW = 165, btnH = 28, colA = 173, colB = 348, colRight = 523;
+            const int btnW = 165, btnH = 28, colB = 348, colRight = 523;
 
-            btnRefresh = new Button { Text = "Оновити", Size = new Size(btnW, btnH), Location = new Point(colA, 40) };
+            btnRefresh = new Button { Text = "", Size = new Size(40, 28), Location = new Point(298, 40), Anchor = AnchorStyles.Top | AnchorStyles.Right };
             btnRefresh.Click += (s, e) => { RefreshSessions(); RefreshPolicyStatus(); };
+            themeToolTip.SetToolTip(btnRefresh, "Оновити (F5)");
 
-            btnConnect = new Button { Text = "Підключитися", Size = new Size(btnW, btnH), Location = new Point(colB, 40), Enabled = false };
-            btnConnect.Click += BtnConnect_Click;
+            btnServerCache = new Button
+            {
+                Text = "Обслуговування 1С ▾",
+                Size = new Size(btnW, btnH),
+                Location = new Point(colB, 40),
+                Anchor = AnchorStyles.Top | AnchorStyles.Right
+            };
+
+            ToolStripMenuItem miDoServerCleanup = new ToolStripMenuItem("Очистити серверний кеш 1С");
+            miDoServerCleanup.Click += MiServerCacheCleanup_Click;
+            ToolStripMenuItem miScheduleServerCleanup = new ToolStripMenuItem("Запланувати очищення...");
+            miScheduleServerCleanup.Click += MiScheduleCacheCleanup_Click;
+            ToolStripMenuItem miCancelScheduleServerCleanup = new ToolStripMenuItem("Скасувати заплановане");
+            miCancelScheduleServerCleanup.Click += MiCancelScheduledCleanup_Click;
+
+            serverCacheMenu = new ContextMenuStrip();
+            serverCacheMenu.Items.Add(miDoServerCleanup);
+            serverCacheMenu.Items.Add(new ToolStripSeparator());
+            serverCacheMenu.Items.Add(miScheduleServerCleanup);
+            serverCacheMenu.Items.Add(miCancelScheduleServerCleanup);
+
+            btnServerCache.Click += (s, e) => serverCacheMenu.Show(btnServerCache, new Point(0, btnServerCache.Height));
 
             btnReboot = new Button
             {
                 Text = "Перезавантаження ▾",
                 Size = new Size(btnW, btnH),
-                Location = new Point(colRight, 40)
+                Location = new Point(colRight, 40),
+                Anchor = AnchorStyles.Top | AnchorStyles.Right
             };
 
             pnlIndicator = new Panel
@@ -423,7 +628,7 @@ namespace ShadowSessionTool
             Controls.Add(btnThemeBlue);
             Controls.Add(lblSelect);
             Controls.Add(btnRefresh);
-            Controls.Add(btnConnect);
+            Controls.Add(btnServerCache);
             Controls.Add(pnlIndicator);
             Controls.Add(lblStatus);
             Controls.Add(btnEnablePolicy);
@@ -511,7 +716,6 @@ namespace ShadowSessionTool
         private void UpdateActionButtons()
         {
             int selCount = lvSessions.SelectedItems.Count;
-            btnConnect.Enabled = (selCount == 1) && !IsOwnSessionSelected();
             btnDisconnect.Enabled = (selCount >= 1);
         }
 
@@ -874,6 +1078,311 @@ namespace ShadowSessionTool
             }
         }
 
+        private void MiServerCacheCleanup_Click(object sender, EventArgs e)
+        {
+            DialogResult confirm = MessageBox.Show(this,
+                "Це зупинить службу сервера 1С/BAF і очистить серверний кеш (тека srvinfo).\n\n" +
+                "1С стане недоступним для ВСІХ користувачів сервера на деякий час, доки служба не запуститься знову " +
+                "(це відрізняється від \"Очистити кеш 1С/BAS\" у контекстному меню, яка чистить кеш лише одного вибраного користувача).\n\n" +
+                "Усім активним сеансам буде надіслано попередження і 30-секундний відлік перед початком. Продовжити?",
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes) return;
+
+            List<int> ids = new List<int>();
+            foreach (RdpSession s in _allSessions)
+            {
+                int id;
+                if (int.TryParse(s.Id, out id) && id != _ownSessionId) ids.Add(id);
+            }
+
+            if (ids.Count > 0)
+            {
+                SendMessageToSessions(ids, "Через 30 секунд розпочнеться технічне обслуговування сервера 1С/BAF. Будь ласка, збережіть роботу.");
+            }
+
+            if (ShowCountdownDialog(30)) return;
+
+            btnServerCache.Enabled = false;
+            Cursor = Cursors.WaitCursor;
+
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                ServerCacheCleanup.CleanupResult result = ServerCacheCleanup.Run(true);
+
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        Cursor = Cursors.Default;
+                        btnServerCache.Enabled = true;
+                        if (ids.Count > 0) SendMessageToSessions(ids, "Можна працювати.");
+                        ShowServerCleanupResult(result);
+                        RefreshSessions();
+                    }));
+                }
+            });
+        }
+
+        private void ShowServerCleanupResult(ServerCacheCleanup.CleanupResult result)
+        {
+            StringBuilder sb = new StringBuilder();
+            foreach (string s in result.ServicesProcessed) sb.AppendLine(s);
+            if (result.ServicesProcessed.Count > 0)
+            {
+                sb.AppendLine(string.Format("Видалено тек кешу: {0}", result.FoldersDeleted.Count));
+            }
+            if (result.Errors.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("Помилки:");
+                foreach (string err in result.Errors) sb.AppendLine(err);
+            }
+            if (sb.Length == 0) sb.Append("Готово.");
+
+            MessageBox.Show(this, sb.ToString(), "Очищення серверного кешу 1С",
+                MessageBoxButtons.OK, result.Errors.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+        }
+
+        private bool ShowCountdownDialog(int seconds)
+        {
+            using (Form dlg = new Form())
+            {
+                dlg.Text = "Технічне обслуговування 1С/BAF";
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.MinimizeBox = false;
+                dlg.MaximizeBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.ControlBox = false;
+                dlg.ClientSize = new Size(340, 130);
+                dlg.Font = Font;
+                dlg.BackColor = BackColor;
+
+                Label lbl = new Label
+                {
+                    AutoSize = true,
+                    MaximumSize = new Size(316, 0),
+                    Location = new Point(12, 15),
+                    ForeColor = lblSelect.ForeColor,
+                    Text = "Попередження надіслано. Очищення почнеться через:"
+                };
+
+                Label lblCountdown = new Label
+                {
+                    AutoSize = true,
+                    Font = new Font("Segoe UI", 20F, FontStyle.Bold),
+                    Location = new Point(12, 45),
+                    ForeColor = lblSelect.ForeColor,
+                    Text = seconds.ToString()
+                };
+
+                Button cancelBtn = new Button
+                {
+                    Text = "Скасувати",
+                    Size = new Size(100, 28),
+                    Location = new Point(228, 90),
+                    DialogResult = DialogResult.Cancel,
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
+                };
+                cancelBtn.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+
+                dlg.Controls.Add(lbl);
+                dlg.Controls.Add(lblCountdown);
+                dlg.Controls.Add(cancelBtn);
+                dlg.CancelButton = cancelBtn;
+
+                int remaining = seconds;
+                Timer timer = new Timer { Interval = 1000 };
+                timer.Tick += (s, e) =>
+                {
+                    remaining--;
+                    lblCountdown.Text = remaining.ToString();
+                    if (remaining <= 0)
+                    {
+                        timer.Stop();
+                        dlg.DialogResult = DialogResult.OK;
+                        dlg.Close();
+                    }
+                };
+                timer.Start();
+
+                DialogResult result = dlg.ShowDialog(this);
+                timer.Stop();
+                timer.Dispose();
+
+                return result != DialogResult.OK;
+            }
+        }
+
+        private class CacheScheduleResult
+        {
+            public bool Weekly;
+            public string Time;
+        }
+
+        private void MiScheduleCacheCleanup_Click(object sender, EventArgs e)
+        {
+            CacheScheduleResult sr = ShowScheduleCacheDialog();
+            if (sr == null) return;
+
+            RunHidden("schtasks.exe", string.Format("/delete /tn \"{0}\" /f", ServerCacheCleanup.TaskName));
+
+            string exePath = Application.ExecutablePath;
+            string freq = sr.Weekly ? "WEEKLY" : "DAILY";
+            string createArgs = string.Format(
+                "/create /tn \"{0}\" /tr \"\\\"{1}\\\" {2}\" /sc {3} /st {4} /ru SYSTEM /rl HIGHEST /f",
+                ServerCacheCleanup.TaskName, exePath, ServerCacheCleanup.AutoRunArg, freq, sr.Time);
+
+            int exitCode = RunHidden("schtasks.exe", createArgs);
+
+            if (exitCode == 0)
+            {
+                MessageBox.Show(this,
+                    string.Format("Завдання заплановано: {0}, о {1}. Виконується без попереджень користувачам, як окремий процес (SYSTEM). Логи — у C:\\Scripts\\1C_Maintenance\\Logs.",
+                        sr.Weekly ? "щотижня" : "щодня", sr.Time),
+                    "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else
+            {
+                MessageBox.Show(this, "Не вдалося створити завдання в Планувальнику. Перевірте права адміністратора.",
+                    "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void MiCancelScheduledCleanup_Click(object sender, EventArgs e)
+        {
+            int exitCode = RunHidden("schtasks.exe", string.Format("/delete /tn \"{0}\" /f", ServerCacheCleanup.TaskName));
+            if (exitCode == 0)
+            {
+                MessageBox.Show(this, "Заплановане очищення скасовано.", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else
+            {
+                MessageBox.Show(this, "Запланованого завдання не знайдено.", "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        private static int RunHidden(string exe, string args)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo(exe, args)
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    p.WaitForExit(15000);
+                    return p.ExitCode;
+                }
+            }
+            catch
+            {
+                return -1;
+            }
+        }
+
+        private CacheScheduleResult ShowScheduleCacheDialog()
+        {
+            using (Form dlg = new Form())
+            {
+                dlg.Text = "Запланувати очищення серверного кешу 1С";
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.MinimizeBox = false;
+                dlg.MaximizeBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.ClientSize = new Size(340, 190);
+                dlg.Font = Font;
+                dlg.BackColor = BackColor;
+
+                RadioButton radDaily = new RadioButton
+                {
+                    Text = "Щодня",
+                    Checked = true,
+                    Location = new Point(12, 15),
+                    AutoSize = true,
+                    ForeColor = lblSelect.ForeColor
+                };
+                RadioButton radWeekly = new RadioButton
+                {
+                    Text = "Щотижня",
+                    Location = new Point(12, 42),
+                    AutoSize = true,
+                    ForeColor = lblSelect.ForeColor
+                };
+
+                Label lblTime = new Label
+                {
+                    Text = "О годині:",
+                    Location = new Point(12, 78),
+                    AutoSize = true,
+                    ForeColor = lblSelect.ForeColor
+                };
+                DateTimePicker dtpTime = new DateTimePicker
+                {
+                    Format = DateTimePickerFormat.Custom,
+                    CustomFormat = "HH:mm",
+                    ShowUpDown = true,
+                    Value = DateTime.Today.AddHours(3),
+                    Location = new Point(90, 75),
+                    Size = new Size(80, 23)
+                };
+
+                Label lblWarn = new Label
+                {
+                    Text = "Без попереджень користувачам — виконується як окремий фоновий процес.",
+                    ForeColor = Color.DimGray,
+                    Location = new Point(12, 108),
+                    MaximumSize = new Size(316, 0),
+                    AutoSize = true
+                };
+
+                Button ok = new Button
+                {
+                    Text = "Запланувати",
+                    DialogResult = DialogResult.OK,
+                    Location = new Point(152, 150),
+                    Size = new Size(90, 28),
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
+                };
+                ok.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+
+                Button cancel = new Button
+                {
+                    Text = "Скасувати",
+                    DialogResult = DialogResult.Cancel,
+                    Location = new Point(248, 150),
+                    Size = new Size(80, 28),
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
+                };
+                cancel.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+
+                dlg.Controls.Add(radDaily);
+                dlg.Controls.Add(radWeekly);
+                dlg.Controls.Add(lblTime);
+                dlg.Controls.Add(dtpTime);
+                dlg.Controls.Add(lblWarn);
+                dlg.Controls.Add(ok);
+                dlg.Controls.Add(cancel);
+                dlg.AcceptButton = ok;
+                dlg.CancelButton = cancel;
+
+                if (dlg.ShowDialog(this) != DialogResult.OK) return null;
+
+                return new CacheScheduleResult { Weekly = radWeekly.Checked, Time = dtpTime.Value.ToString("HH:mm") };
+            }
+        }
+
         private class RebootScheduleResult
         {
             public int DelayMinutes;
@@ -1046,11 +1555,11 @@ namespace ShadowSessionTool
                     DialogResult = DialogResult.OK,
                     Location = new Point(172, 196),
                     Size = new Size(90, 28),
-                    FlatStyle = btnConnect.FlatStyle,
-                    BackColor = btnConnect.BackColor,
-                    ForeColor = btnConnect.ForeColor
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
                 };
-                ok.FlatAppearance.BorderColor = btnConnect.FlatAppearance.BorderColor;
+                ok.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
 
                 Button cancel = new Button
                 {
@@ -1058,11 +1567,11 @@ namespace ShadowSessionTool
                     DialogResult = DialogResult.Cancel,
                     Location = new Point(268, 196),
                     Size = new Size(90, 28),
-                    FlatStyle = btnConnect.FlatStyle,
-                    BackColor = btnConnect.BackColor,
-                    ForeColor = btnConnect.ForeColor
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
                 };
-                cancel.FlatAppearance.BorderColor = btnConnect.FlatAppearance.BorderColor;
+                cancel.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
 
                 dlg.Controls.Add(radRelative);
                 dlg.Controls.Add(numMinutes);
@@ -1229,11 +1738,11 @@ namespace ShadowSessionTool
                     DialogResult = DialogResult.OK,
                     Location = new Point(216, y),
                     Size = new Size(80, 28),
-                    FlatStyle = btnConnect.FlatStyle,
-                    BackColor = btnConnect.BackColor,
-                    ForeColor = btnConnect.ForeColor
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
                 };
-                ok.FlatAppearance.BorderColor = btnConnect.FlatAppearance.BorderColor;
+                ok.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
 
                 Button cancel = new Button
                 {
@@ -1241,11 +1750,11 @@ namespace ShadowSessionTool
                     DialogResult = DialogResult.Cancel,
                     Location = new Point(308, y),
                     Size = new Size(80, 28),
-                    FlatStyle = btnConnect.FlatStyle,
-                    BackColor = btnConnect.BackColor,
-                    ForeColor = btnConnect.ForeColor
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
                 };
-                cancel.FlatAppearance.BorderColor = btnConnect.FlatAppearance.BorderColor;
+                cancel.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
 
                 dlg.ClientSize = new Size(400, y + 28 + 12);
 
@@ -1432,7 +1941,7 @@ namespace ShadowSessionTool
             lvSessions.BackColor = listBack;
             lvSessions.ForeColor = listFore;
 
-            Button[] buttons = { btnRefresh, btnConnect, btnEnablePolicy, btnDisconnect, btnDisconnectAll, btnReboot };
+            Button[] buttons = { btnRefresh, btnServerCache, btnEnablePolicy, btnDisconnect, btnDisconnectAll, btnReboot };
             foreach (Button btn in buttons)
             {
                 btn.FlatStyle = btnStyle;
@@ -1444,6 +1953,10 @@ namespace ShadowSessionTool
             SetThemeSwatchActive(btnThemeLight, theme == AppTheme.Light, Color.Black);
             SetThemeSwatchActive(btnThemeDark, theme == AppTheme.Dark, Color.White);
             SetThemeSwatchActive(btnThemeBlue, theme == AppTheme.Blue, Color.Black);
+
+            Image oldRefreshIcon = btnRefresh.Image;
+            btnRefresh.Image = CreateRefreshIcon(controlFore);
+            if (oldRefreshIcon != null) oldRefreshIcon.Dispose();
 
             _currentTheme = theme;
 
@@ -1465,6 +1978,26 @@ namespace ShadowSessionTool
             btn.FlatAppearance.BorderColor = active ? activeBorderColor : Color.Gray;
         }
 
+        private static Bitmap CreateRefreshIcon(Color color)
+        {
+            Bitmap bmp = new Bitmap(16, 16);
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.Clear(Color.Transparent);
+                using (Pen pen = new Pen(color, 2f))
+                {
+                    g.DrawArc(pen, 2, 2, 12, 12, -30, 270);
+                }
+                Point[] arrow = { new Point(13, 1), new Point(15, 6), new Point(10, 5) };
+                using (SolidBrush brush = new SolidBrush(color))
+                {
+                    g.FillPolygon(brush, arrow);
+                }
+            }
+            return bmp;
+        }
+
         private static void CopyToClipboard(string value)
         {
             if (string.IsNullOrEmpty(value)) return;
@@ -1482,22 +2015,42 @@ namespace ShadowSessionTool
         private void RefreshSessions()
         {
             _allSessions = GetRdpSessions();
+            ApplyCachedDescriptions(_allSessions);
             ApplyFilter();
             FetchDescriptionsAsync(_allSessions);
         }
 
+        private void ApplyCachedDescriptions(List<RdpSession> sessions)
+        {
+            foreach (RdpSession s in sessions)
+            {
+                string cached;
+                if (_descriptionCache.TryGetValue(s.UserName, out cached))
+                {
+                    s.Description = cached;
+                }
+            }
+        }
+
         private void FetchDescriptionsAsync(List<RdpSession> sessions)
         {
+            List<RdpSession> toFetch = new List<RdpSession>();
+            foreach (RdpSession s in sessions)
+            {
+                if (!_descriptionCache.ContainsKey(s.UserName)) toFetch.Add(s);
+            }
+            if (toFetch.Count == 0) return;
+
             System.Threading.ThreadPool.QueueUserWorkItem(delegate
             {
-                Dictionary<string, string> cache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                foreach (RdpSession s in sessions)
+                Dictionary<string, string> fetched = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (RdpSession s in toFetch)
                 {
                     string desc;
-                    if (!cache.TryGetValue(s.UserName, out desc))
+                    if (!fetched.TryGetValue(s.UserName, out desc))
                     {
                         desc = GetUserDescription(s.UserName);
-                        cache[s.UserName] = desc;
+                        fetched[s.UserName] = desc;
                     }
                     s.Description = desc;
                 }
@@ -1506,6 +2059,10 @@ namespace ShadowSessionTool
                 {
                     BeginInvoke(new Action(delegate
                     {
+                        foreach (KeyValuePair<string, string> kv in fetched)
+                        {
+                            _descriptionCache[kv.Key] = kv.Value;
+                        }
                         if (_allSessions == sessions) ApplyFilter();
                     }));
                 }
