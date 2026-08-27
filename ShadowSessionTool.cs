@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.DirectoryServices;
+using System.DirectoryServices.AccountManagement;
 using System.Drawing;
 using System.IO;
 using System.Net;
@@ -75,7 +76,8 @@ namespace ShadowSessionTool
         internal enum WtsInfoClass
         {
             WTSUserName = 5,
-            WTSWinStationName = 6
+            WTSWinStationName = 6,
+            WTSDomainName = 7
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -96,6 +98,14 @@ namespace ShadowSessionTool
         public WtsConnectState RawState;
         public int OneCCount;
         public string Description;
+        public string FullName;
+        public string DomainName;
+    }
+
+    internal class UserAccountInfo
+    {
+        public string Description = "";
+        public string FullName = "";
     }
 
     internal class ListViewItemComparer : System.Collections.IComparer
@@ -297,6 +307,209 @@ namespace ShadowSessionTool
         }
     }
 
+    internal class IbaseSection
+    {
+        public string Name;
+        public int StartLine;
+        public int EndLine;
+        public readonly Dictionary<string, string> Props = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        public bool IsDatabase { get { return Props.ContainsKey("Connect"); } }
+
+        public string Folder
+        {
+            get
+            {
+                string f;
+                return Props.TryGetValue("Folder", out f) ? f : "/";
+            }
+        }
+    }
+
+    internal static class IbaseFile
+    {
+        private static readonly string[] ExtraDbKeys =
+        {
+            "ClientConnectionSpeed", "App", "WA", "Version", "AppArch",
+            "DisableLocalSpeechToText", "DefaultApp", "DefaultVersion", "UseProxy", "WSA"
+        };
+
+        internal static string GetPathForUser(string userName)
+        {
+            int slashIdx = userName.IndexOf('\\');
+            string plain = slashIdx >= 0 ? userName.Substring(slashIdx + 1) : userName;
+            string systemDrive = Environment.GetEnvironmentVariable("SystemDrive") + "\\";
+            return Path.Combine(systemDrive, "Users", plain, "AppData", "Roaming", "1C", "1CEStart", "ibases.v8i");
+        }
+
+        internal static List<IbaseSection> Parse(string[] lines)
+        {
+            List<IbaseSection> sections = new List<IbaseSection>();
+            IbaseSection current = null;
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i].TrimEnd();
+                if (line.Length > 2 && line[0] == '[' && line[line.Length - 1] == ']')
+                {
+                    if (current != null) current.EndLine = i;
+                    current = new IbaseSection { Name = line.Substring(1, line.Length - 2), StartLine = i };
+                    sections.Add(current);
+                    continue;
+                }
+                if (current == null) continue;
+
+                int eq = line.IndexOf('=');
+                if (eq > 0)
+                {
+                    current.Props[line.Substring(0, eq)] = line.Substring(eq + 1);
+                }
+            }
+            if (current != null) current.EndLine = lines.Length;
+
+            return sections;
+        }
+
+        internal static List<IbaseSection> ParseFile(string path)
+        {
+            if (!File.Exists(path)) return new List<IbaseSection>();
+            return Parse(File.ReadAllLines(path, Encoding.UTF8));
+        }
+
+        internal static void DeleteSections(string path, List<IbaseSection> toDelete)
+        {
+            string[] lines = File.ReadAllLines(path, Encoding.UTF8);
+            bool[] exclude = new bool[lines.Length];
+            foreach (IbaseSection s in toDelete)
+            {
+                for (int i = s.StartLine; i < s.EndLine && i < lines.Length; i++) exclude[i] = true;
+            }
+
+            List<string> kept = new List<string>();
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (!exclude[i]) kept.Add(lines[i]);
+            }
+
+            File.WriteAllLines(path, kept.ToArray(), new UTF8Encoding(false));
+        }
+
+        private static void AppendFolderBlock(IbaseSection s, List<string> outLines)
+        {
+            outLines.Add("[" + s.Name + "]");
+            outLines.Add("ID=" + Guid.NewGuid());
+            outLines.Add("OrderInList=-1");
+            outLines.Add("Folder=" + (string.IsNullOrEmpty(s.Folder) ? "/" : s.Folder));
+            outLines.Add("OrderInTree=0");
+            outLines.Add("External=0");
+        }
+
+        private static void AppendDatabaseBlock(IbaseSection s, List<string> outLines)
+        {
+            outLines.Add("[" + s.Name + "]");
+            string conn;
+            s.Props.TryGetValue("Connect", out conn);
+            outLines.Add("Connect=" + conn);
+            outLines.Add("ID=" + Guid.NewGuid());
+            outLines.Add("OrderInList=-1");
+            outLines.Add("Folder=" + (string.IsNullOrEmpty(s.Folder) ? "/" : s.Folder));
+            outLines.Add("OrderInTree=0");
+            outLines.Add("External=0");
+
+            foreach (string key in ExtraDbKeys)
+            {
+                string val;
+                if (s.Props.TryGetValue(key, out val)) outLines.Add(key + "=" + val);
+            }
+        }
+
+        private static void EnsureFolderChain(string folderRef, List<IbaseSection> sourceSections,
+            Dictionary<string, bool> existingNames, Dictionary<string, bool> ensuredFolders, List<string> outLines)
+        {
+            if (string.IsNullOrEmpty(folderRef) || folderRef == "/") return;
+
+            string folderName = folderRef.TrimStart('/');
+            if (existingNames.ContainsKey(folderName)) return;
+            if (ensuredFolders.ContainsKey(folderName)) return;
+
+            IbaseSection folderSection = null;
+            foreach (IbaseSection s in sourceSections)
+            {
+                if (!s.IsDatabase && string.Equals(s.Name, folderName, StringComparison.OrdinalIgnoreCase))
+                {
+                    folderSection = s;
+                    break;
+                }
+            }
+            if (folderSection == null) return;
+
+            EnsureFolderChain(folderSection.Folder, sourceSections, existingNames, ensuredFolders, outLines);
+
+            AppendFolderBlock(folderSection, outLines);
+            existingNames[folderName] = true;
+            ensuredFolders[folderName] = true;
+        }
+
+        internal class AddResult
+        {
+            public int Added;
+            public int Skipped;
+        }
+
+        internal static AddResult AddDatabases(string targetPath, List<IbaseSection> selectedDbs, List<IbaseSection> sourceSections)
+        {
+            AddResult result = new AddResult();
+
+            string dir = Path.GetDirectoryName(targetPath);
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+
+            List<IbaseSection> existing = ParseFile(targetPath);
+
+            Dictionary<string, bool> existingConnects = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, bool> existingNames = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            foreach (IbaseSection s in existing)
+            {
+                existingNames[s.Name] = true;
+                string conn;
+                if (s.Props.TryGetValue("Connect", out conn)) existingConnects[conn.Trim()] = true;
+            }
+
+            Dictionary<string, bool> ensuredFolders = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            List<string> newLines = new List<string>();
+
+            foreach (IbaseSection dbSection in selectedDbs)
+            {
+                string conn;
+                if (!dbSection.Props.TryGetValue("Connect", out conn)) continue;
+
+                if (existingConnects.ContainsKey(conn.Trim()))
+                {
+                    result.Skipped++;
+                    continue;
+                }
+
+                EnsureFolderChain(dbSection.Folder, sourceSections, existingNames, ensuredFolders, newLines);
+
+                AppendDatabaseBlock(dbSection, newLines);
+                existingConnects[conn.Trim()] = true;
+                existingNames[dbSection.Name] = true;
+                result.Added++;
+            }
+
+            if (newLines.Count > 0)
+            {
+                bool fileExisted = File.Exists(targetPath);
+                using (StreamWriter sw = new StreamWriter(targetPath, true, new UTF8Encoding(false)))
+                {
+                    if (fileExisted) sw.WriteLine();
+                    foreach (string line in newLines) sw.WriteLine(line);
+                }
+            }
+
+            return result;
+        }
+    }
+
     internal class MainForm : Form
     {
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -312,7 +525,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.5.0";
+        private const string AppVersion = "1.7.0";
 
         private static readonly string[] MessageTemplates =
         {
@@ -354,11 +567,14 @@ namespace ShadowSessionTool
         private ToolStripMenuItem miCtxDisconnect;
         private ToolStripMenuItem miCtxEnd1C;
         private ToolStripMenuItem miCtxClearCache1C;
+        private ToolStripMenuItem miCtxAddDatabases;
+        private ToolStripMenuItem miCtxViewDatabases;
         private ToolStripMenuItem miCtxMessage;
         private ToolStripMenuItem miCtxMessageAll;
+        private bool _suppressIbaseCheckEvents;
 
         private List<RdpSession> _allSessions = new List<RdpSession>();
-        private readonly Dictionary<string, string> _descriptionCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, UserAccountInfo> _accountInfoCache = new Dictionary<string, UserAccountInfo>(StringComparer.OrdinalIgnoreCase);
         private int _sortColumn = -1;
         private SortOrder _sortOrder = SortOrder.None;
         private readonly int _ownSessionId = Process.GetCurrentProcess().SessionId;
@@ -379,7 +595,7 @@ namespace ShadowSessionTool
             };
             Shown += (s, e) =>
             {
-                SendMessage(txtSearch.Handle, EM_SETCUEBANNER, IntPtr.Zero, "Пошук за користувачем/описом...");
+                SendMessage(txtSearch.Handle, EM_SETCUEBANNER, IntPtr.Zero, "Пошук за користувачем/описом/іменем...");
                 ApplyTheme(LoadSavedTheme());
                 RefreshSessions();
                 RefreshPolicyStatus();
@@ -584,6 +800,10 @@ namespace ShadowSessionTool
             miCtxEnd1C.Click += MiCtxEnd1C_Click;
             miCtxClearCache1C = new ToolStripMenuItem("Очистити кеш 1С/BAS");
             miCtxClearCache1C.Click += MiCtxClearCache1C_Click;
+            miCtxAddDatabases = new ToolStripMenuItem("Додати бази 1С...");
+            miCtxAddDatabases.Click += MiAddDatabases_Click;
+            miCtxViewDatabases = new ToolStripMenuItem("Переглянути список баз...");
+            miCtxViewDatabases.Click += MiViewUserDatabases_Click;
             miCtxMessage = new ToolStripMenuItem("Надіслати повідомлення");
             miCtxMessage.Click += MiCtxMessage_Click;
             miCtxMessageAll = new ToolStripMenuItem("Надіслати повідомлення всім");
@@ -595,6 +815,9 @@ namespace ShadowSessionTool
             ctxMenu.Items.Add(miCtxDisconnect);
             ctxMenu.Items.Add(miCtxEnd1C);
             ctxMenu.Items.Add(miCtxClearCache1C);
+            ctxMenu.Items.Add(new ToolStripSeparator());
+            ctxMenu.Items.Add(miCtxAddDatabases);
+            ctxMenu.Items.Add(miCtxViewDatabases);
             ctxMenu.Items.Add(new ToolStripSeparator());
             ctxMenu.Items.Add(miCtxMessage);
             ctxMenu.Items.Add(miCtxMessageAll);
@@ -612,6 +835,7 @@ namespace ShadowSessionTool
                 ContextMenuStrip = ctxMenu
             };
             lvSessions.Columns.Add("Користувач", 170);
+            lvSessions.Columns.Add("Повне ім'я", 160);
             lvSessions.Columns.Add("ID сеансу", 90);
             lvSessions.Columns.Add("Стан", 130);
             lvSessions.Columns.Add("Ім'я сеансу", 150);
@@ -679,7 +903,7 @@ namespace ShadowSessionTool
             foreach (ListViewItem item in lvSessions.SelectedItems)
             {
                 int c;
-                if (int.TryParse(item.SubItems[4].Text, out c)) oneCTotal += c;
+                if (int.TryParse(item.SubItems[5].Text, out c)) oneCTotal += c;
             }
             miCtxEnd1C.Enabled = oneCTotal > 0;
             miCtxEnd1C.Text = oneCTotal > 0
@@ -687,6 +911,13 @@ namespace ShadowSessionTool
                 : "Завершити 1С/BAS";
 
             miCtxClearCache1C.Enabled = (selCount >= 1);
+
+            miCtxAddDatabases.Enabled = (selCount >= 1);
+            miCtxAddDatabases.Text = selCount > 1
+                ? string.Format("Додати бази 1С ({0})", selCount)
+                : "Додати бази 1С...";
+
+            miCtxViewDatabases.Enabled = (selCount == 1);
         }
 
         private void LvSessions_ColumnClick(object sender, ColumnClickEventArgs e)
@@ -709,7 +940,7 @@ namespace ShadowSessionTool
         {
             if (lvSessions.SelectedItems.Count != 1) return false;
             int id;
-            if (!int.TryParse(lvSessions.SelectedItems[0].SubItems[1].Text, out id)) return false;
+            if (!int.TryParse(lvSessions.SelectedItems[0].SubItems[2].Text, out id)) return false;
             return id == _ownSessionId;
         }
 
@@ -727,7 +958,7 @@ namespace ShadowSessionTool
                 return;
             }
 
-            string id = lvSessions.SelectedItems[0].SubItems[1].Text;
+            string id = lvSessions.SelectedItems[0].SubItems[2].Text;
             if (!Regex.IsMatch(id, @"^\d+$"))
             {
                 MessageBox.Show(this, "Не вдалося визначити ID сеансу.", "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -766,7 +997,7 @@ namespace ShadowSessionTool
             }
 
             int id;
-            if (!int.TryParse(lvSessions.SelectedItems[0].SubItems[1].Text, out id)) return;
+            if (!int.TryParse(lvSessions.SelectedItems[0].SubItems[2].Text, out id)) return;
 
             if (id == _ownSessionId)
             {
@@ -847,7 +1078,7 @@ namespace ShadowSessionTool
             foreach (ListViewItem item in lvSessions.SelectedItems)
             {
                 int id;
-                if (int.TryParse(item.SubItems[1].Text, out id))
+                if (int.TryParse(item.SubItems[2].Text, out id))
                 {
                     ids.Add(id);
                     names.Add(item.Text);
@@ -951,7 +1182,7 @@ namespace ShadowSessionTool
             foreach (ListViewItem item in lvSessions.SelectedItems)
             {
                 int id;
-                if (int.TryParse(item.SubItems[1].Text, out id)) ids.Add(id);
+                if (int.TryParse(item.SubItems[2].Text, out id)) ids.Add(id);
             }
             if (ids.Count == 0) return;
 
@@ -987,7 +1218,7 @@ namespace ShadowSessionTool
             foreach (ListViewItem item in lvSessions.SelectedItems)
             {
                 int id;
-                if (int.TryParse(item.SubItems[1].Text, out id))
+                if (int.TryParse(item.SubItems[2].Text, out id))
                 {
                     ids.Add(id);
                     userNames.Add(item.Text);
@@ -1076,6 +1307,291 @@ namespace ShadowSessionTool
                     }
                 }
             }
+        }
+
+        private void MiAddDatabases_Click(object sender, EventArgs e)
+        {
+            if (lvSessions.SelectedItems.Count == 0) return;
+
+            List<string> targetUsers = new List<string>();
+            foreach (ListViewItem item in lvSessions.SelectedItems) targetUsers.Add(item.Text);
+
+            string sourcePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "1C", "1CEStart", "ibases.v8i");
+            if (!File.Exists(sourcePath))
+            {
+                MessageBox.Show(this,
+                    "Не знайдено ваш власний список баз 1С:\n" + sourcePath + "\n\nСпочатку додайте потрібні бази у своєму 1CEStart.",
+                    "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            List<IbaseSection> sourceSections;
+            try
+            {
+                sourceSections = IbaseFile.Parse(File.ReadAllLines(sourcePath, Encoding.UTF8));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Не вдалося прочитати " + sourcePath + ": " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            List<IbaseSection> selected = ShowIbaseTreeDialog(
+                "Додати бази 1С обраним користувачам",
+                sourceSections,
+                "Додати",
+                "Позначте бази (або цілі теки) зі свого списку 1С, які потрібно додати обраним користувачам:");
+            if (selected == null) return;
+
+            List<IbaseSection> dbsOnly = new List<IbaseSection>();
+            foreach (IbaseSection s in selected)
+            {
+                if (s.IsDatabase) dbsOnly.Add(s);
+            }
+
+            if (dbsOnly.Count == 0)
+            {
+                MessageBox.Show(this, "Не вибрано жодної бази.", "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            DialogResult confirmAdd = MessageBox.Show(this,
+                string.Format("Додати {0} баз(и) для {1} користувач(ів): {2}?\n\nБази, які вже прописані (за рядком підключення), будуть пропущені.",
+                    dbsOnly.Count, targetUsers.Count, string.Join(", ", targetUsers.ToArray())),
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (confirmAdd != DialogResult.Yes) return;
+
+            StringBuilder summary = new StringBuilder();
+            foreach (string userName in targetUsers)
+            {
+                string targetPath = IbaseFile.GetPathForUser(userName);
+                try
+                {
+                    IbaseFile.AddResult r = IbaseFile.AddDatabases(targetPath, dbsOnly, sourceSections);
+                    summary.AppendLine(string.Format("{0}: додано {1}, пропущено (вже є) {2}", userName, r.Added, r.Skipped));
+                }
+                catch (Exception ex)
+                {
+                    summary.AppendLine(string.Format("{0}: помилка — {1}", userName, ex.Message));
+                }
+            }
+
+            MessageBox.Show(this, summary.ToString(), "Додавання баз 1С", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void MiViewUserDatabases_Click(object sender, EventArgs e)
+        {
+            if (lvSessions.SelectedItems.Count != 1)
+            {
+                MessageBox.Show(this, "Виберіть рівно одного користувача.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            string userName = lvSessions.SelectedItems[0].Text;
+            string path = IbaseFile.GetPathForUser(userName);
+
+            if (!File.Exists(path))
+            {
+                MessageBox.Show(this, string.Format("У користувача \"{0}\" ще немає списку баз 1С.", userName),
+                    "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            List<IbaseSection> sections;
+            try
+            {
+                sections = IbaseFile.Parse(File.ReadAllLines(path, Encoding.UTF8));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Не вдалося прочитати файл: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (sections.Count == 0)
+            {
+                MessageBox.Show(this, "Список баз порожній.", "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            List<IbaseSection> toDelete = ShowIbaseTreeDialog(
+                string.Format("Список баз 1С — {0}", userName),
+                sections,
+                "Видалити",
+                "Позначте застарілі записи (або теки) для видалення зі списку баз користувача:");
+            if (toDelete == null || toDelete.Count == 0) return;
+
+            DialogResult confirmDelete = MessageBox.Show(this,
+                string.Format("Видалити {0} запис(ів) зі списку баз користувача \"{1}\"?\n\nЦе прибирає їх лише зі стартового списку 1С, самі бази даних не видаляються.",
+                    toDelete.Count, userName),
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (confirmDelete != DialogResult.Yes) return;
+
+            try
+            {
+                IbaseFile.DeleteSections(path, toDelete);
+                MessageBox.Show(this, "Видалено.", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Не вдалося зберегти зміни: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private List<IbaseSection> ShowIbaseTreeDialog(string title, List<IbaseSection> sections, string actionButtonText, string hintText)
+        {
+            using (Form dlg = new Form())
+            {
+                dlg.Text = title;
+                dlg.FormBorderStyle = FormBorderStyle.Sizable;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.MinimizeBox = false;
+                dlg.MaximizeBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.ClientSize = new Size(420, 480);
+                dlg.MinimumSize = new Size(340, 300);
+                dlg.Font = Font;
+                dlg.BackColor = BackColor;
+
+                Label lblHintDlg = new Label
+                {
+                    AutoSize = true,
+                    MaximumSize = new Size(396, 0),
+                    Location = new Point(12, 10),
+                    ForeColor = lblHint.ForeColor,
+                    Text = hintText
+                };
+
+                TreeView tree = new TreeView
+                {
+                    CheckBoxes = true,
+                    Location = new Point(12, 40),
+                    Size = new Size(396, 376),
+                    Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+                    BackColor = txtSearch.BackColor,
+                    ForeColor = txtSearch.ForeColor
+                };
+
+                Dictionary<TreeNode, IbaseSection> nodeMap = new Dictionary<TreeNode, IbaseSection>();
+                TreeNode root = BuildIbaseTree(sections, nodeMap);
+                List<TreeNode> topNodes = new List<TreeNode>();
+                foreach (TreeNode child in root.Nodes) topNodes.Add(child);
+                foreach (TreeNode child in topNodes) tree.Nodes.Add(child);
+                tree.ExpandAll();
+                tree.AfterCheck += IbaseTree_AfterCheck;
+
+                Button ok = new Button
+                {
+                    Text = actionButtonText,
+                    DialogResult = DialogResult.OK,
+                    Location = new Point(228, 428),
+                    Size = new Size(90, 28),
+                    Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
+                };
+                ok.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+
+                Button cancel = new Button
+                {
+                    Text = "Скасувати",
+                    DialogResult = DialogResult.Cancel,
+                    Location = new Point(324, 428),
+                    Size = new Size(84, 28),
+                    Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
+                };
+                cancel.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+
+                dlg.Controls.Add(lblHintDlg);
+                dlg.Controls.Add(tree);
+                dlg.Controls.Add(ok);
+                dlg.Controls.Add(cancel);
+                dlg.AcceptButton = ok;
+                dlg.CancelButton = cancel;
+
+                if (dlg.ShowDialog(this) != DialogResult.OK) return null;
+
+                List<IbaseSection> selected = new List<IbaseSection>();
+                foreach (KeyValuePair<TreeNode, IbaseSection> kv in nodeMap)
+                {
+                    if (kv.Key.Checked) selected.Add(kv.Value);
+                }
+                return selected;
+            }
+        }
+
+        private void IbaseTree_AfterCheck(object sender, TreeViewEventArgs e)
+        {
+            if (_suppressIbaseCheckEvents) return;
+            _suppressIbaseCheckEvents = true;
+            SetChildrenChecked(e.Node, e.Node.Checked);
+            _suppressIbaseCheckEvents = false;
+        }
+
+        private static void SetChildrenChecked(TreeNode node, bool value)
+        {
+            foreach (TreeNode child in node.Nodes)
+            {
+                child.Checked = value;
+                SetChildrenChecked(child, value);
+            }
+        }
+
+        private static TreeNode BuildIbaseTree(List<IbaseSection> sections, Dictionary<TreeNode, IbaseSection> nodeMap)
+        {
+            TreeNode root = new TreeNode("/");
+            Dictionary<string, TreeNode> folderNodes = new Dictionary<string, TreeNode>(StringComparer.OrdinalIgnoreCase);
+            folderNodes["/"] = root;
+
+            List<IbaseSection> folderSections = new List<IbaseSection>();
+            foreach (IbaseSection s in sections)
+            {
+                if (!s.IsDatabase) folderSections.Add(s);
+            }
+
+            Dictionary<string, bool> created = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            created["/"] = true;
+
+            bool progress = true;
+            while (progress)
+            {
+                progress = false;
+                foreach (IbaseSection s in folderSections)
+                {
+                    string key = "/" + s.Name;
+                    if (created.ContainsKey(key)) continue;
+
+                    string parentKey = string.IsNullOrEmpty(s.Folder) ? "/" : s.Folder;
+                    TreeNode parentNode;
+                    if (!folderNodes.TryGetValue(parentKey, out parentNode)) continue;
+
+                    TreeNode node = new TreeNode(s.Name);
+                    nodeMap[node] = s;
+                    parentNode.Nodes.Add(node);
+                    folderNodes[key] = node;
+                    created[key] = true;
+                    progress = true;
+                }
+            }
+
+            foreach (IbaseSection s in sections)
+            {
+                if (!s.IsDatabase) continue;
+
+                string parentKey = string.IsNullOrEmpty(s.Folder) ? "/" : s.Folder;
+                TreeNode parentNode;
+                if (!folderNodes.TryGetValue(parentKey, out parentNode)) parentNode = root;
+
+                TreeNode dbNode = new TreeNode(s.Name);
+                nodeMap[dbNode] = s;
+                parentNode.Nodes.Add(dbNode);
+            }
+
+            return root;
         }
 
         private void MiServerCacheCleanup_Click(object sender, EventArgs e)
@@ -1611,7 +2127,7 @@ namespace ShadowSessionTool
             foreach (ListViewItem item in lvSessions.SelectedItems)
             {
                 int id;
-                if (int.TryParse(item.SubItems[1].Text, out id)) ids.Add(id);
+                if (int.TryParse(item.SubItems[2].Text, out id)) ids.Add(id);
             }
             if (ids.Count == 0) return;
 
@@ -2015,53 +2531,63 @@ namespace ShadowSessionTool
         private void RefreshSessions()
         {
             _allSessions = GetRdpSessions();
-            ApplyCachedDescriptions(_allSessions);
+            ApplyCachedAccountInfo(_allSessions);
             ApplyFilter();
-            FetchDescriptionsAsync(_allSessions);
+            FetchAccountInfoAsync(_allSessions);
         }
 
-        private void ApplyCachedDescriptions(List<RdpSession> sessions)
+        private static string GetAccountCacheKey(RdpSession s)
+        {
+            bool isLocal = string.IsNullOrEmpty(s.DomainName) ||
+                string.Equals(s.DomainName, Environment.MachineName, StringComparison.OrdinalIgnoreCase);
+            return isLocal ? s.UserName : s.DomainName + "\\" + s.UserName;
+        }
+
+        private void ApplyCachedAccountInfo(List<RdpSession> sessions)
         {
             foreach (RdpSession s in sessions)
             {
-                string cached;
-                if (_descriptionCache.TryGetValue(s.UserName, out cached))
+                UserAccountInfo cached;
+                if (_accountInfoCache.TryGetValue(GetAccountCacheKey(s), out cached))
                 {
-                    s.Description = cached;
+                    s.Description = cached.Description;
+                    s.FullName = cached.FullName;
                 }
             }
         }
 
-        private void FetchDescriptionsAsync(List<RdpSession> sessions)
+        private void FetchAccountInfoAsync(List<RdpSession> sessions)
         {
             List<RdpSession> toFetch = new List<RdpSession>();
             foreach (RdpSession s in sessions)
             {
-                if (!_descriptionCache.ContainsKey(s.UserName)) toFetch.Add(s);
+                if (!_accountInfoCache.ContainsKey(GetAccountCacheKey(s))) toFetch.Add(s);
             }
             if (toFetch.Count == 0) return;
 
             System.Threading.ThreadPool.QueueUserWorkItem(delegate
             {
-                Dictionary<string, string> fetched = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                Dictionary<string, UserAccountInfo> fetched = new Dictionary<string, UserAccountInfo>(StringComparer.OrdinalIgnoreCase);
                 foreach (RdpSession s in toFetch)
                 {
-                    string desc;
-                    if (!fetched.TryGetValue(s.UserName, out desc))
+                    string key = GetAccountCacheKey(s);
+                    UserAccountInfo info;
+                    if (!fetched.TryGetValue(key, out info))
                     {
-                        desc = GetUserDescription(s.UserName);
-                        fetched[s.UserName] = desc;
+                        info = GetUserAccountInfo(s.UserName, s.DomainName);
+                        fetched[key] = info;
                     }
-                    s.Description = desc;
+                    s.Description = info.Description;
+                    s.FullName = info.FullName;
                 }
 
                 if (IsHandleCreated && !IsDisposed)
                 {
                     BeginInvoke(new Action(delegate
                     {
-                        foreach (KeyValuePair<string, string> kv in fetched)
+                        foreach (KeyValuePair<string, UserAccountInfo> kv in fetched)
                         {
-                            _descriptionCache[kv.Key] = kv.Value;
+                            _accountInfoCache[kv.Key] = kv.Value;
                         }
                         if (_allSessions == sessions) ApplyFilter();
                     }));
@@ -2081,7 +2607,9 @@ namespace ShadowSessionTool
                     bool matchesUser = s.UserName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
                     bool matchesDesc = !string.IsNullOrEmpty(s.Description) &&
                         s.Description.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
-                    if (!matchesUser && !matchesDesc) continue;
+                    bool matchesFullName = !string.IsNullOrEmpty(s.FullName) &&
+                        s.FullName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (!matchesUser && !matchesDesc && !matchesFullName) continue;
                 }
 
                 bool isOwn = false;
@@ -2089,6 +2617,7 @@ namespace ShadowSessionTool
                 if (int.TryParse(s.Id, out id) && id == _ownSessionId) isOwn = true;
 
                 ListViewItem item = new ListViewItem(s.UserName);
+                item.SubItems.Add(s.FullName);
                 item.SubItems.Add(s.Id);
                 item.SubItems.Add(s.State);
                 item.SubItems.Add(isOwn ? s.SessionName + " (поточний)" : s.SessionName);
@@ -2157,6 +2686,8 @@ namespace ShadowSessionTool
                     int oneCCount;
                     oneCCounts.TryGetValue(si.SessionID, out oneCCount);
 
+                    string domainName = GetSessionDomainName(si.SessionID);
+
                     result.Add(new RdpSession
                     {
                         UserName = userName,
@@ -2165,7 +2696,9 @@ namespace ShadowSessionTool
                         State = TranslateState(si.State),
                         RawState = si.State,
                         OneCCount = oneCCount,
-                        Description = ""
+                        Description = "",
+                        FullName = "",
+                        DomainName = domainName
                     });
                 }
             }
@@ -2195,23 +2728,56 @@ namespace ShadowSessionTool
             return result;
         }
 
-        private static string GetUserDescription(string userName)
+        private string GetSessionDomainName(int sessionId)
         {
+            IntPtr buffer;
+            int bytesReturned;
+            string result = "";
+
+            if (Wts.WTSQuerySessionInformation(IntPtr.Zero, sessionId, Wts.WtsInfoClass.WTSDomainName, out buffer, out bytesReturned))
+            {
+                if (buffer != IntPtr.Zero)
+                {
+                    result = Marshal.PtrToStringUni(buffer);
+                    Wts.WTSFreeMemory(buffer);
+                }
+            }
+
+            return result;
+        }
+
+        private static UserAccountInfo GetUserAccountInfo(string userName, string domainName)
+        {
+            UserAccountInfo info = new UserAccountInfo();
+
             int slashIdx = userName.IndexOf('\\');
             string plainUserName = slashIdx >= 0 ? userName.Substring(slashIdx + 1) : userName;
 
+            bool isLocal = string.IsNullOrEmpty(domainName) ||
+                string.Equals(domainName, Environment.MachineName, StringComparison.OrdinalIgnoreCase);
+
             try
             {
-                using (DirectoryEntry entry = new DirectoryEntry("WinNT://" + Environment.MachineName + "/" + plainUserName + ",user"))
+                using (PrincipalContext ctx = isLocal
+                    ? new PrincipalContext(ContextType.Machine)
+                    : new PrincipalContext(ContextType.Domain, domainName))
                 {
-                    object desc = entry.Properties["Description"].Value;
-                    return desc != null ? desc.ToString() : "";
+                    using (UserPrincipal user = UserPrincipal.FindByIdentity(ctx, IdentityType.SamAccountName, plainUserName))
+                    {
+                        if (user != null)
+                        {
+                            info.Description = user.Description ?? "";
+                            info.FullName = user.DisplayName ?? "";
+                        }
+                    }
                 }
             }
             catch
             {
-                return "";
+                // немає довіри до домену, обліковий запис недоступний тощо - лишаємо порожнім
             }
+
+            return info;
         }
 
         private static bool Is1CProcess(string processName)
