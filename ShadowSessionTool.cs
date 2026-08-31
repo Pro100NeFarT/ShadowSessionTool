@@ -268,6 +268,131 @@ namespace ShadowSessionTool
             return result;
         }
 
+        internal static CleanupResult StartServices()
+        {
+            CleanupResult result = new CleanupResult();
+            foreach (string svcName in ServiceNames)
+            {
+                ServiceController sc = TryGetService(svcName);
+                if (sc == null) continue; // служба не встановлена на цьому сервері
+
+                try
+                {
+                    sc.Refresh();
+                    if (sc.Status == ServiceControllerStatus.Running)
+                    {
+                        result.ServicesProcessed.Add(svcName + ": вже запущено");
+                        continue;
+                    }
+
+                    sc.Start();
+                    sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(60));
+                    result.ServicesProcessed.Add(svcName + ": запущено");
+                }
+                catch (Exception ex)
+                {
+                    result.Errors.Add("Не вдалося запустити службу \"" + svcName + "\": " + ex.Message);
+                }
+            }
+
+            if (result.ServicesProcessed.Count == 0 && result.Errors.Count == 0)
+            {
+                result.Errors.Add("Жодна відома служба 1С/BAF не встановлена на цьому сервері.");
+            }
+            return result;
+        }
+
+        internal static CleanupResult StopServices()
+        {
+            CleanupResult result = new CleanupResult();
+            foreach (string svcName in ServiceNames)
+            {
+                ServiceController sc = TryGetService(svcName);
+                if (sc == null) continue;
+
+                try
+                {
+                    sc.Refresh();
+                    if (sc.Status != ServiceControllerStatus.Running)
+                    {
+                        continue; // встановлена, але вже не запущена - не чіпаємо
+                    }
+
+                    sc.Stop();
+                    sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+                    result.ServicesProcessed.Add(svcName + ": зупинено");
+                }
+                catch (Exception ex)
+                {
+                    result.Errors.Add("Не вдалося зупинити службу \"" + svcName + "\": " + ex.Message);
+                }
+            }
+
+            if (result.ServicesProcessed.Count == 0 && result.Errors.Count == 0)
+            {
+                result.Errors.Add("Жодна відома служба 1С/BAF наразі не запущена на цьому сервері.");
+            }
+            return result;
+        }
+
+        internal static CleanupResult RestartServices()
+        {
+            CleanupResult result = new CleanupResult();
+            foreach (string svcName in ServiceNames)
+            {
+                ServiceController sc = TryGetService(svcName);
+                if (sc == null) continue;
+
+                try
+                {
+                    sc.Refresh();
+                    if (sc.Status == ServiceControllerStatus.Running)
+                    {
+                        sc.Stop();
+                        sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+                    }
+
+                    sc.Start();
+                    sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(60));
+                    result.ServicesProcessed.Add(svcName + ": перезапущено");
+                }
+                catch (Exception ex)
+                {
+                    result.Errors.Add("Не вдалося перезапустити службу \"" + svcName + "\": " + ex.Message);
+                }
+            }
+
+            if (result.ServicesProcessed.Count == 0 && result.Errors.Count == 0)
+            {
+                result.Errors.Add("Жодна відома служба 1С/BAF не встановлена на цьому сервері.");
+            }
+            return result;
+        }
+
+        internal static Dictionary<string, ServiceControllerStatus?> GetServiceStatuses()
+        {
+            Dictionary<string, ServiceControllerStatus?> result = new Dictionary<string, ServiceControllerStatus?>();
+            foreach (string svcName in ServiceNames)
+            {
+                ServiceController sc = TryGetService(svcName);
+                if (sc == null)
+                {
+                    result[svcName] = null;
+                    continue;
+                }
+                try
+                {
+                    sc.Refresh();
+                    result[svcName] = sc.Status;
+                }
+                catch
+                {
+                    result[svcName] = null;
+                }
+            }
+            return result;
+        }
+
         private static ServiceController TryGetService(string name)
         {
             try
@@ -560,6 +685,7 @@ namespace ShadowSessionTool
         private Label lblExternalIpCaption;
         private Label lblExternalIp;
         private readonly List<Label> _localIpLabels = new List<Label>();
+        private readonly List<Label> _serviceStatusLabels = new List<Label>();
 
         private ContextMenuStrip ctxMenu;
         private ToolStripMenuItem miCtxConnect;
@@ -591,6 +717,7 @@ namespace ShadowSessionTool
                 {
                     RefreshSessions();
                     RefreshPolicyStatus();
+                    RefreshServiceStatusLabels();
                 }
             };
             Shown += (s, e) =>
@@ -599,6 +726,7 @@ namespace ShadowSessionTool
                 ApplyTheme(LoadSavedTheme());
                 RefreshSessions();
                 RefreshPolicyStatus();
+                RefreshServiceStatusLabels();
                 CheckForUpdatesAsync();
                 ShowLocalIp();
                 FetchExternalIpAsync();
@@ -665,7 +793,7 @@ namespace ShadowSessionTool
             const int btnW = 165, btnH = 28, colB = 348, colRight = 523;
 
             btnRefresh = new Button { Text = "", Size = new Size(40, 28), Location = new Point(298, 40), Anchor = AnchorStyles.Top | AnchorStyles.Right };
-            btnRefresh.Click += (s, e) => { RefreshSessions(); RefreshPolicyStatus(); };
+            btnRefresh.Click += (s, e) => { RefreshSessions(); RefreshPolicyStatus(); RefreshServiceStatusLabels(); };
             themeToolTip.SetToolTip(btnRefresh, "Оновити (F5)");
 
             btnServerCache = new Button
@@ -676,6 +804,13 @@ namespace ShadowSessionTool
                 Anchor = AnchorStyles.Top | AnchorStyles.Right
             };
 
+            ToolStripMenuItem miStartServices = new ToolStripMenuItem("Запустити служби 1С/BAF");
+            miStartServices.Click += MiStartServices_Click;
+            ToolStripMenuItem miStopServices = new ToolStripMenuItem("Зупинити служби 1С/BAF");
+            miStopServices.Click += MiStopServices_Click;
+            ToolStripMenuItem miRestartServices = new ToolStripMenuItem("Перезапустити служби 1С/BAF");
+            miRestartServices.Click += MiRestartServices_Click;
+
             ToolStripMenuItem miDoServerCleanup = new ToolStripMenuItem("Очистити серверний кеш 1С");
             miDoServerCleanup.Click += MiServerCacheCleanup_Click;
             ToolStripMenuItem miScheduleServerCleanup = new ToolStripMenuItem("Запланувати очищення...");
@@ -684,6 +819,10 @@ namespace ShadowSessionTool
             miCancelScheduleServerCleanup.Click += MiCancelScheduledCleanup_Click;
 
             serverCacheMenu = new ContextMenuStrip();
+            serverCacheMenu.Items.Add(miStartServices);
+            serverCacheMenu.Items.Add(miStopServices);
+            serverCacheMenu.Items.Add(miRestartServices);
+            serverCacheMenu.Items.Add(new ToolStripSeparator());
             serverCacheMenu.Items.Add(miDoServerCleanup);
             serverCacheMenu.Items.Add(new ToolStripSeparator());
             serverCacheMenu.Items.Add(miScheduleServerCleanup);
@@ -1634,6 +1773,117 @@ namespace ShadowSessionTool
                         if (ids.Count > 0) SendMessageToSessions(ids, "Можна працювати.");
                         ShowServerCleanupResult(result);
                         RefreshSessions();
+                        RefreshServiceStatusLabels();
+                    }));
+                }
+            });
+        }
+
+        private void MiStartServices_Click(object sender, EventArgs e)
+        {
+            btnServerCache.Enabled = false;
+            Cursor = Cursors.WaitCursor;
+
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                ServerCacheCleanup.CleanupResult result = ServerCacheCleanup.StartServices();
+
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        Cursor = Cursors.Default;
+                        btnServerCache.Enabled = true;
+                        ShowServiceActionResult(result, "Запуск служб 1С/BAF", false);
+                        RefreshServiceStatusLabels();
+                    }));
+                }
+            });
+        }
+
+        private void MiStopServices_Click(object sender, EventArgs e)
+        {
+            DialogResult confirm = MessageBox.Show(this,
+                "Це зупинить служби сервера 1С/BAF (без очищення кешу). 1С стане недоступним для ВСІХ користувачів сервера, " +
+                "доки служби не буде запущено знову.\n\n" +
+                "Усім активним сеансам буде надіслано попередження і 30-секундний відлік перед початком. Продовжити?",
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes) return;
+
+            List<int> ids = new List<int>();
+            foreach (RdpSession s in _allSessions)
+            {
+                int id;
+                if (int.TryParse(s.Id, out id) && id != _ownSessionId) ids.Add(id);
+            }
+
+            if (ids.Count > 0)
+            {
+                SendMessageToSessions(ids, "Через 30 секунд розпочнеться технічне обслуговування сервера 1С/BAF. Будь ласка, збережіть роботу.");
+            }
+
+            if (ShowCountdownDialog(30)) return;
+
+            btnServerCache.Enabled = false;
+            Cursor = Cursors.WaitCursor;
+
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                ServerCacheCleanup.CleanupResult result = ServerCacheCleanup.StopServices();
+
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        Cursor = Cursors.Default;
+                        btnServerCache.Enabled = true;
+                        if (ids.Count > 0) SendMessageToSessions(ids, "Технічне обслуговування завершено.");
+                        ShowServiceActionResult(result, "Зупинка служб 1С/BAF", false);
+                        RefreshServiceStatusLabels();
+                    }));
+                }
+            });
+        }
+
+        private void MiRestartServices_Click(object sender, EventArgs e)
+        {
+            DialogResult confirm = MessageBox.Show(this,
+                "Це перезапустить служби сервера 1С/BAF (без очищення кешу). 1С стане недоступним для ВСІХ користувачів сервера " +
+                "на деякий час.\n\n" +
+                "Усім активним сеансам буде надіслано попередження і 30-секундний відлік перед початком. Продовжити?",
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes) return;
+
+            List<int> ids = new List<int>();
+            foreach (RdpSession s in _allSessions)
+            {
+                int id;
+                if (int.TryParse(s.Id, out id) && id != _ownSessionId) ids.Add(id);
+            }
+
+            if (ids.Count > 0)
+            {
+                SendMessageToSessions(ids, "Через 30 секунд розпочнеться технічне обслуговування сервера 1С/BAF. Будь ласка, збережіть роботу.");
+            }
+
+            if (ShowCountdownDialog(30)) return;
+
+            btnServerCache.Enabled = false;
+            Cursor = Cursors.WaitCursor;
+
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                ServerCacheCleanup.CleanupResult result = ServerCacheCleanup.RestartServices();
+
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        Cursor = Cursors.Default;
+                        btnServerCache.Enabled = true;
+                        if (ids.Count > 0) SendMessageToSessions(ids, "Можна працювати.");
+                        ShowServiceActionResult(result, "Перезапуск служб 1С/BAF", false);
+                        RefreshServiceStatusLabels();
                     }));
                 }
             });
@@ -1641,9 +1891,14 @@ namespace ShadowSessionTool
 
         private void ShowServerCleanupResult(ServerCacheCleanup.CleanupResult result)
         {
+            ShowServiceActionResult(result, "Очищення серверного кешу 1С", true);
+        }
+
+        private void ShowServiceActionResult(ServerCacheCleanup.CleanupResult result, string title, bool showFoldersDeleted)
+        {
             StringBuilder sb = new StringBuilder();
             foreach (string s in result.ServicesProcessed) sb.AppendLine(s);
-            if (result.ServicesProcessed.Count > 0)
+            if (showFoldersDeleted && result.ServicesProcessed.Count > 0)
             {
                 sb.AppendLine(string.Format("Видалено тек кешу: {0}", result.FoldersDeleted.Count));
             }
@@ -1655,7 +1910,7 @@ namespace ShadowSessionTool
             }
             if (sb.Length == 0) sb.Append("Готово.");
 
-            MessageBox.Show(this, sb.ToString(), "Очищення серверного кешу 1С",
+            MessageBox.Show(this, sb.ToString(), title,
                 MessageBoxButtons.OK, result.Errors.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
         }
 
@@ -2450,6 +2705,7 @@ namespace ShadowSessionTool
             lblExternalIpCaption.ForeColor = hintFore;
             lblExternalIp.ForeColor = hintFore;
             foreach (Label lbl in _localIpLabels) lbl.ForeColor = hintFore;
+            RefreshServiceStatusLabels();
 
             txtSearch.BackColor = textBoxBack;
             txtSearch.ForeColor = textBoxFore;
@@ -2959,6 +3215,76 @@ namespace ShadowSessionTool
                     _localIpLabels.Add(lbl);
                     y += lbl.PreferredHeight;
                 }
+            }
+        }
+
+        private void RefreshServiceStatusLabels()
+        {
+            Dictionary<string, ServiceControllerStatus?> statuses = ServerCacheCleanup.GetServiceStatuses();
+
+            foreach (Label old in _serviceStatusLabels) Controls.Remove(old);
+            _serviceStatusLabels.Clear();
+
+            Font font = new Font("Segoe UI", 8F);
+            const int x = 300;
+            int y = 152;
+
+            Label caption = new Label
+            {
+                AutoSize = true,
+                Font = font,
+                Location = new Point(x, y),
+                Text = "Служби 1С:",
+                ForeColor = lblHint.ForeColor
+            };
+            Controls.Add(caption);
+            _serviceStatusLabels.Add(caption);
+            y += caption.PreferredHeight;
+
+            foreach (KeyValuePair<string, ServiceControllerStatus?> kv in statuses)
+            {
+                string text;
+                Color color;
+                if (!kv.Value.HasValue)
+                {
+                    text = kv.Key + " — не встановлено";
+                    color = Color.Gray;
+                }
+                else if (kv.Value.Value == ServiceControllerStatus.Running)
+                {
+                    text = kv.Key + " — запущено";
+                    color = Color.ForestGreen;
+                }
+                else
+                {
+                    text = kv.Key + " — " + TranslateServiceStatus(kv.Value.Value);
+                    color = Color.Firebrick;
+                }
+
+                Label lbl = new Label
+                {
+                    AutoSize = true,
+                    MaximumSize = new Size(370, 0),
+                    Font = font,
+                    Location = new Point(x, y),
+                    Text = text,
+                    ForeColor = color
+                };
+                Controls.Add(lbl);
+                _serviceStatusLabels.Add(lbl);
+                y += lbl.PreferredHeight;
+            }
+        }
+
+        private static string TranslateServiceStatus(ServiceControllerStatus status)
+        {
+            switch (status)
+            {
+                case ServiceControllerStatus.Stopped: return "зупинено";
+                case ServiceControllerStatus.StartPending: return "запускається...";
+                case ServiceControllerStatus.StopPending: return "зупиняється...";
+                case ServiceControllerStatus.Paused: return "призупинено";
+                default: return status.ToString();
             }
         }
 
