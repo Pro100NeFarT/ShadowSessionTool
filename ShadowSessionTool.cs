@@ -650,7 +650,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.7.0";
+        private const string AppVersion = "1.7.3";
 
         private static readonly string[] MessageTemplates =
         {
