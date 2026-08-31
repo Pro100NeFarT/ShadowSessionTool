@@ -10,6 +10,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.ServiceProcess;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -147,7 +148,7 @@ namespace ShadowSessionTool
         internal const string TaskName = "ShadowSessionTool_CleanServerCache1C";
         internal const string AutoRunArg = "/autoclean1c";
 
-        private static readonly string[] ServiceNames =
+        internal static readonly string[] ServiceNames =
         {
             "1C:Enterprise 8.3 Server Agent (x86-64)",
             "BAF Server Agent (x86-64)"
@@ -268,7 +269,7 @@ namespace ShadowSessionTool
             return result;
         }
 
-        private static ServiceController TryGetService(string name)
+        internal static ServiceController TryGetService(string name)
         {
             try
             {
@@ -280,6 +281,123 @@ namespace ShadowSessionTool
             {
                 return null;
             }
+        }
+
+        /// <summary>Запускає всі встановлені, але не запущені служби 1С/BAF. Не деструктивна дія - без попереджень.</summary>
+        internal static CleanupResult StartServices()
+        {
+            CleanupResult result = new CleanupResult();
+            foreach (string svcName in ServiceNames)
+            {
+                ServiceController sc = TryGetService(svcName);
+                if (sc == null) continue;
+
+                try
+                {
+                    sc.Refresh();
+                    if (sc.Status == ServiceControllerStatus.Running)
+                    {
+                        result.ServicesProcessed.Add(svcName + ": вже запущено");
+                        continue;
+                    }
+
+                    sc.Start();
+                    sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(60));
+                    result.ServicesProcessed.Add(svcName + ": запущено");
+                }
+                catch (Exception ex)
+                {
+                    result.Errors.Add("Не вдалося запустити службу \"" + svcName + "\": " + ex.Message);
+                }
+            }
+            return result;
+        }
+
+        /// <summary>Зупиняє всі встановлені й запущені служби 1С/BAF. Виклик попередження активним сеансам - відповідальність UI-рівня.</summary>
+        internal static CleanupResult StopServices()
+        {
+            CleanupResult result = new CleanupResult();
+            foreach (string svcName in ServiceNames)
+            {
+                ServiceController sc = TryGetService(svcName);
+                if (sc == null) continue;
+
+                try
+                {
+                    sc.Refresh();
+                    if (sc.Status != ServiceControllerStatus.Running)
+                    {
+                        result.ServicesProcessed.Add(svcName + ": вже зупинено");
+                        continue;
+                    }
+
+                    sc.Stop();
+                    sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+                    result.ServicesProcessed.Add(svcName + ": зупинено");
+                }
+                catch (Exception ex)
+                {
+                    result.Errors.Add("Не вдалося зупинити службу \"" + svcName + "\": " + ex.Message);
+                }
+            }
+            return result;
+        }
+
+        /// <summary>Перезапускає встановлені й запущені служби 1С/BAF (без очищення кешу, на відміну від Run()).</summary>
+        internal static CleanupResult RestartServices()
+        {
+            CleanupResult result = new CleanupResult();
+            foreach (string svcName in ServiceNames)
+            {
+                ServiceController sc = TryGetService(svcName);
+                if (sc == null) continue;
+
+                try
+                {
+                    sc.Refresh();
+                    if (sc.Status != ServiceControllerStatus.Running)
+                    {
+                        result.ServicesProcessed.Add(svcName + ": не запущено, пропущено");
+                        continue;
+                    }
+
+                    sc.Stop();
+                    sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+                    sc.Start();
+                    sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(60));
+                    result.ServicesProcessed.Add(svcName + ": перезапущено");
+                }
+                catch (Exception ex)
+                {
+                    result.Errors.Add("Не вдалося перезапустити службу \"" + svcName + "\": " + ex.Message);
+                }
+            }
+            return result;
+        }
+
+        /// <summary>Статус кожної відомої служби 1С/BAF: "Running"/"Stopped"/... або null, якщо не встановлена.</summary>
+        internal static Dictionary<string, string> GetServiceStatuses()
+        {
+            Dictionary<string, string> statuses = new Dictionary<string, string>();
+            foreach (string svcName in ServiceNames)
+            {
+                ServiceController sc = TryGetService(svcName);
+                if (sc == null)
+                {
+                    statuses[svcName] = null;
+                    continue;
+                }
+                try
+                {
+                    sc.Refresh();
+                    statuses[svcName] = sc.Status.ToString();
+                }
+                catch
+                {
+                    statuses[svcName] = null;
+                }
+            }
+            return statuses;
         }
 
         private static void WriteLog(CleanupResult result, List<string> stoppedServices)
@@ -510,6 +628,1068 @@ namespace ShadowSessionTool
         }
     }
 
+    /// <summary>Профіль віддаленого сервера (розділ 3 плану) - зберігається в реєстрі, по одному підключу на профіль.</summary>
+    internal class ServerProfile
+    {
+        public Guid Id = Guid.NewGuid();
+        public string Name = "";
+        public string Host = "";
+        public int Port = RemoteProtocol.DefaultPort;
+        public string User = "";
+        public string Password = "";
+        public double LastPingMs = -1; // -1 = ще не перевірено, -2 = недоступний
+    }
+
+    /// <summary>Захист секретів (паролі профілів і "Дозволити керування") через DPAPI - System.Security.dll.</summary>
+    internal static class CryptoHelper
+    {
+        internal static string ProtectString(string plain)
+        {
+            if (string.IsNullOrEmpty(plain)) return "";
+            try
+            {
+                byte[] data = Encoding.UTF8.GetBytes(plain);
+                byte[] protectedData = System.Security.Cryptography.ProtectedData.Protect(
+                    data, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+                return Convert.ToBase64String(protectedData);
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        internal static string UnprotectString(string protectedBase64)
+        {
+            if (string.IsNullOrEmpty(protectedBase64)) return "";
+            try
+            {
+                byte[] protectedData = Convert.FromBase64String(protectedBase64);
+                byte[] data = System.Security.Cryptography.ProtectedData.Unprotect(
+                    protectedData, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+                return Encoding.UTF8.GetString(data);
+            }
+            catch
+            {
+                return "";
+            }
+        }
+    }
+
+    /// <summary>Зберігання профілів серверів і налаштувань "Дозволити керування" під Software\ShadowSessionTool (розділ 3).</summary>
+    internal static class ServerProfileStore
+    {
+        private const string ServersSubKey = @"Software\ShadowSessionTool\Servers";
+        private const string RemoteControlSubKey = @"Software\ShadowSessionTool\RemoteControl";
+
+        internal static List<ServerProfile> LoadProfiles()
+        {
+            List<ServerProfile> result = new List<ServerProfile>();
+            try
+            {
+                using (RegistryKey root = Registry.CurrentUser.OpenSubKey(ServersSubKey))
+                {
+                    if (root == null) return result;
+                    foreach (string sub in root.GetSubKeyNames())
+                    {
+                        using (RegistryKey key = root.OpenSubKey(sub))
+                        {
+                            if (key == null) continue;
+                            ServerProfile p = new ServerProfile();
+                            Guid id;
+                            p.Id = Guid.TryParse(sub, out id) ? id : Guid.NewGuid();
+                            p.Name = Convert.ToString(key.GetValue("Name", ""));
+                            p.Host = Convert.ToString(key.GetValue("Host", ""));
+                            p.Port = Convert.ToInt32(key.GetValue("Port", RemoteProtocol.DefaultPort));
+                            p.User = Convert.ToString(key.GetValue("User", ""));
+                            p.Password = CryptoHelper.UnprotectString(Convert.ToString(key.GetValue("Password", "")));
+                            result.Add(p);
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // не критично - повертаємо те, що встигли завантажити
+            }
+            return result;
+        }
+
+        internal static void SaveProfile(ServerProfile p)
+        {
+            using (RegistryKey root = Registry.CurrentUser.CreateSubKey(ServersSubKey))
+            using (RegistryKey key = root.CreateSubKey(p.Id.ToString()))
+            {
+                key.SetValue("Name", p.Name ?? "");
+                key.SetValue("Host", p.Host ?? "");
+                key.SetValue("Port", p.Port, RegistryValueKind.DWord);
+                key.SetValue("User", p.User ?? "");
+                key.SetValue("Password", CryptoHelper.ProtectString(p.Password ?? ""));
+            }
+        }
+
+        internal static void DeleteProfile(Guid id)
+        {
+            try
+            {
+                using (RegistryKey root = Registry.CurrentUser.OpenSubKey(ServersSubKey, true))
+                {
+                    if (root != null) root.DeleteSubKeyTree(id.ToString(), false);
+                }
+            }
+            catch
+            {
+                // не критично
+            }
+        }
+
+        internal class RemoteControlSettings
+        {
+            public bool Enabled;
+            public int Port = RemoteProtocol.DefaultPort;
+            public string User = "";
+            public string Password = "";
+        }
+
+        internal static RemoteControlSettings LoadRemoteControlSettings()
+        {
+            RemoteControlSettings s = new RemoteControlSettings();
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RemoteControlSubKey))
+                {
+                    if (key != null)
+                    {
+                        s.Enabled = Convert.ToInt32(key.GetValue("Enabled", 0)) != 0;
+                        s.Port = Convert.ToInt32(key.GetValue("Port", RemoteProtocol.DefaultPort));
+                        s.User = Convert.ToString(key.GetValue("User", ""));
+                        s.Password = CryptoHelper.UnprotectString(Convert.ToString(key.GetValue("Password", "")));
+                    }
+                }
+            }
+            catch
+            {
+                // не критично - застосуємо вимкнений стан за замовчуванням
+            }
+            return s;
+        }
+
+        internal static void SaveRemoteControlSettings(RemoteControlSettings s)
+        {
+            using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RemoteControlSubKey))
+            {
+                key.SetValue("Enabled", s.Enabled ? 1 : 0, RegistryValueKind.DWord);
+                key.SetValue("Port", s.Port, RegistryValueKind.DWord);
+                key.SetValue("User", s.User ?? "");
+                key.SetValue("Password", CryptoHelper.ProtectString(s.Password ?? ""));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Кадрування/шифрування/(де)серіалізація протоколу віддаленого керування (розділ 5).
+    /// Кадр: [4 байти довжини][IV(16)+AES-256-CBC-PKCS7 шифротекст]. Payload у відкритому вигляді:
+    /// "КОМАНДА\nключ1=значення1\nключ2=значення2\n..." (значення екранують \ і переноси рядків).
+    /// </summary>
+    internal static class RemoteProtocol
+    {
+        internal const int DefaultPort = 51823;
+
+        // Сіль KDF - не є секретом (секрет це пароль профілю/"Дозволити керування"), однакова на клієнті й сервері.
+        private static readonly byte[] KeySalt = Encoding.UTF8.GetBytes("ShadowSessionTool.RemoteControl.Salt.v1");
+
+        internal static byte[] DeriveKey(string password)
+        {
+            using (Rfc2898DeriveBytes kdf = new Rfc2898DeriveBytes(password ?? "", KeySalt, 10000))
+            {
+                return kdf.GetBytes(32);
+            }
+        }
+
+        private static RijndaelManaged CreateAes()
+        {
+            RijndaelManaged aes = new RijndaelManaged();
+            aes.BlockSize = 128;
+            aes.KeySize = 256;
+            aes.Mode = CipherMode.CBC;
+            aes.Padding = PaddingMode.PKCS7;
+            return aes;
+        }
+
+        internal static byte[] Encrypt(byte[] key, string plainText)
+        {
+            byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
+            using (RijndaelManaged aes = CreateAes())
+            {
+                aes.Key = key;
+                aes.GenerateIV();
+                byte[] iv = aes.IV;
+                using (ICryptoTransform enc = aes.CreateEncryptor())
+                {
+                    byte[] cipher = enc.TransformFinalBlock(plainBytes, 0, plainBytes.Length);
+                    byte[] combined = new byte[iv.Length + cipher.Length];
+                    Buffer.BlockCopy(iv, 0, combined, 0, iv.Length);
+                    Buffer.BlockCopy(cipher, 0, combined, iv.Length, cipher.Length);
+                    return combined;
+                }
+            }
+        }
+
+        internal static string Decrypt(byte[] key, byte[] combined)
+        {
+            if (combined.Length < 16) throw new CryptographicException("Кадр закороткий.");
+            using (RijndaelManaged aes = CreateAes())
+            {
+                aes.Key = key;
+                byte[] iv = new byte[16];
+                Buffer.BlockCopy(combined, 0, iv, 0, 16);
+                aes.IV = iv;
+                using (ICryptoTransform dec = aes.CreateDecryptor())
+                {
+                    byte[] cipher = new byte[combined.Length - 16];
+                    Buffer.BlockCopy(combined, 16, cipher, 0, cipher.Length);
+                    byte[] plain = dec.TransformFinalBlock(cipher, 0, cipher.Length);
+                    return Encoding.UTF8.GetString(plain);
+                }
+            }
+        }
+
+        internal static void WriteFrame(NetworkStream stream, byte[] data)
+        {
+            byte[] lenBytes = BitConverter.GetBytes(data.Length);
+            stream.Write(lenBytes, 0, 4);
+            stream.Write(data, 0, data.Length);
+            stream.Flush();
+        }
+
+        internal static byte[] ReadFrame(NetworkStream stream, int maxSize)
+        {
+            byte[] lenBytes = ReadExact(stream, 4);
+            int len = BitConverter.ToInt32(lenBytes, 0);
+            if (len < 0 || len > maxSize) throw new IOException("Некоректний розмір кадру протоколу: " + len);
+            return ReadExact(stream, len);
+        }
+
+        private static byte[] ReadExact(NetworkStream stream, int count)
+        {
+            byte[] buf = new byte[count];
+            int offset = 0;
+            while (offset < count)
+            {
+                int read = stream.Read(buf, offset, count - offset);
+                if (read <= 0) throw new IOException("З'єднання закрито передчасно.");
+                offset += read;
+            }
+            return buf;
+        }
+
+        internal static string Escape(string value)
+        {
+            if (value == null) return "";
+            return value.Replace("\\", "\\\\").Replace("\n", "\\n").Replace("\r", "");
+        }
+
+        internal static string Unescape(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return "";
+            StringBuilder sb = new StringBuilder(value.Length);
+            for (int i = 0; i < value.Length; i++)
+            {
+                char c = value[i];
+                if (c == '\\' && i + 1 < value.Length)
+                {
+                    char next = value[i + 1];
+                    if (next == 'n') { sb.Append('\n'); i++; continue; }
+                    if (next == '\\') { sb.Append('\\'); i++; continue; }
+                }
+                sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        internal static string BuildMessage(string command, Dictionary<string, string> fields)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append(command).Append('\n');
+            if (fields != null)
+            {
+                foreach (KeyValuePair<string, string> kv in fields)
+                {
+                    sb.Append(kv.Key).Append('=').Append(Escape(kv.Value)).Append('\n');
+                }
+            }
+            return sb.ToString();
+        }
+
+        internal class ParsedMessage
+        {
+            public string Command = "";
+            public readonly Dictionary<string, string> Fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            public string Get(string key)
+            {
+                string v;
+                return Fields.TryGetValue(key, out v) ? v : "";
+            }
+        }
+
+        internal static ParsedMessage ParseMessage(string text)
+        {
+            ParsedMessage msg = new ParsedMessage();
+            string[] lines = text.Split('\n');
+            if (lines.Length == 0) return msg;
+            msg.Command = lines[0];
+            for (int i = 1; i < lines.Length; i++)
+            {
+                string line = lines[i];
+                if (line.Length == 0) continue;
+                int eq = line.IndexOf('=');
+                if (eq < 0) continue;
+                msg.Fields[line.Substring(0, eq)] = Unescape(line.Substring(eq + 1));
+            }
+            return msg;
+        }
+
+        // Внутрішньополеві розділювачі (не \n, щоб уникнути подвійного екранування) - для списків сеансів/служб/секцій ibase.
+        internal const char FieldSep = '\x01';
+        internal const char RecordSep = '\x02';
+        internal const char ExtraKvSep = '\x03';
+
+        internal static string JoinFields(params string[] fields)
+        {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < fields.Length; i++)
+            {
+                if (i > 0) sb.Append(FieldSep);
+                string f = fields[i] ?? "";
+                sb.Append(f.Replace(FieldSep, ' ').Replace(RecordSep, ' '));
+            }
+            return sb.ToString();
+        }
+
+        internal static string[] SplitFields(string joined)
+        {
+            return (joined ?? "").Split(FieldSep);
+        }
+    }
+
+    /// <summary>
+    /// Клієнтська сторона протоколу (розділ 5/6) - кожен виклик відкриває окреме TCP-з'єднання,
+    /// шифрує запит паролем профілю й чекає зашифровану відповідь. Викликати лише з фонового потоку.
+    /// </summary>
+    internal static class RemoteClient
+    {
+        internal class RemoteException : Exception
+        {
+            internal RemoteException(string message) : base(message) { }
+        }
+
+        private static RemoteProtocol.ParsedMessage SendCommand(ServerProfile profile, string command, Dictionary<string, string> fields)
+        {
+            if (fields == null) fields = new Dictionary<string, string>();
+            fields["user"] = profile.User ?? "";
+
+            string plain = RemoteProtocol.BuildMessage(command, fields);
+            byte[] key = RemoteProtocol.DeriveKey(profile.Password);
+            byte[] encrypted = RemoteProtocol.Encrypt(key, plain);
+
+            using (TcpClient client = new TcpClient())
+            {
+                IAsyncResult ar = client.BeginConnect(profile.Host, profile.Port, null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(5000))
+                {
+                    throw new RemoteException(string.Format("Час очікування з'єднання з {0}:{1} минув.", profile.Host, profile.Port));
+                }
+                client.EndConnect(ar);
+
+                using (NetworkStream stream = client.GetStream())
+                {
+                    stream.ReadTimeout = 20000;
+                    stream.WriteTimeout = 20000;
+
+                    RemoteProtocol.WriteFrame(stream, encrypted);
+                    byte[] responseEncrypted = RemoteProtocol.ReadFrame(stream, 32 * 1024 * 1024);
+
+                    string responsePlain;
+                    try
+                    {
+                        responsePlain = RemoteProtocol.Decrypt(key, responseEncrypted);
+                    }
+                    catch (Exception)
+                    {
+                        throw new RemoteException("Не вдалося розшифрувати відповідь сервера (перевірте пароль профілю).");
+                    }
+
+                    RemoteProtocol.ParsedMessage response = RemoteProtocol.ParseMessage(responsePlain);
+                    if (!string.Equals(response.Command, "OK", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string msg = response.Get("message");
+                        throw new RemoteException(string.IsNullOrEmpty(msg) ? "Сервер повернув помилку." : msg);
+                    }
+                    return response;
+                }
+            }
+        }
+
+        private static string JoinIds(List<int> ids)
+        {
+            List<string> s = new List<string>();
+            foreach (int id in ids) s.Add(id.ToString());
+            return string.Join(",", s.ToArray());
+        }
+
+        internal static List<int> ParseIds(string csv)
+        {
+            List<int> result = new List<int>();
+            if (string.IsNullOrEmpty(csv)) return result;
+            foreach (string p in csv.Split(','))
+            {
+                int id;
+                if (int.TryParse(p, out id)) result.Add(id);
+            }
+            return result;
+        }
+
+        internal static List<RdpSession> ListSessions(ServerProfile profile)
+        {
+            RemoteProtocol.ParsedMessage resp = SendCommand(profile, "LIST_SESSIONS", null);
+            List<RdpSession> result = new List<RdpSession>();
+            int count;
+            int.TryParse(resp.Get("count"), out count);
+            for (int i = 0; i < count; i++)
+            {
+                string line = resp.Get("session" + i);
+                string[] f = RemoteProtocol.SplitFields(line);
+                if (f.Length < 9) continue;
+                WtsConnectState rawState;
+                Enum.TryParse(f[4], out rawState);
+                int oneCCount;
+                int.TryParse(f[5], out oneCCount);
+                result.Add(new RdpSession
+                {
+                    UserName = f[0],
+                    SessionName = f[1],
+                    Id = f[2],
+                    State = f[3],
+                    RawState = rawState,
+                    OneCCount = oneCCount,
+                    Description = f[6],
+                    FullName = f[7],
+                    DomainName = f[8]
+                });
+            }
+            return result;
+        }
+
+        internal static void SendMessage(ServerProfile profile, List<int> ids, string message)
+        {
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            fields["ids"] = JoinIds(ids);
+            fields["message"] = message;
+            SendCommand(profile, "SEND_MESSAGE", fields);
+        }
+
+        internal static void LogoffSessions(ServerProfile profile, List<int> ids)
+        {
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            fields["ids"] = JoinIds(ids);
+            SendCommand(profile, "LOGOFF_SESSIONS", fields);
+        }
+
+        internal static string ShadowInfo(ServerProfile profile, int sessionId)
+        {
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            fields["id"] = sessionId.ToString();
+            RemoteProtocol.ParsedMessage resp = SendCommand(profile, "SHADOW_INFO", fields);
+            return resp.Get("userName");
+        }
+
+        internal static void TakeOver(ServerProfile profile, int sessionId, string destStation, string targetPassword)
+        {
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            fields["id"] = sessionId.ToString();
+            fields["destStation"] = destStation;
+            fields["targetPassword"] = targetPassword;
+            SendCommand(profile, "TAKE_OVER", fields);
+        }
+
+        internal static void End1C(ServerProfile profile, List<int> ids)
+        {
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            fields["ids"] = JoinIds(ids);
+            SendCommand(profile, "END_1C", fields);
+        }
+
+        internal static void ClearCache1C(ServerProfile profile, List<int> ids, List<string> userNames)
+        {
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            fields["ids"] = JoinIds(ids);
+            fields["userNames"] = string.Join(RemoteProtocol.FieldSep.ToString(), userNames.ToArray());
+            SendCommand(profile, "CLEAR_CACHE_1C", fields);
+        }
+
+        private static ServerCacheCleanup.CleanupResult ParseCleanupResult(RemoteProtocol.ParsedMessage resp)
+        {
+            ServerCacheCleanup.CleanupResult result = new ServerCacheCleanup.CleanupResult();
+            int n;
+            int.TryParse(resp.Get("processedCount"), out n);
+            for (int i = 0; i < n; i++) result.ServicesProcessed.Add(resp.Get("processed" + i));
+            int m;
+            int.TryParse(resp.Get("errorCount"), out m);
+            for (int i = 0; i < m; i++) result.Errors.Add(resp.Get("error" + i));
+            return result;
+        }
+
+        internal static ServerCacheCleanup.CleanupResult ServerCleanup(ServerProfile profile)
+        {
+            return ParseCleanupResult(SendCommand(profile, "SERVER_CLEANUP", null));
+        }
+
+        internal static ServerCacheCleanup.CleanupResult ServiceStart(ServerProfile profile)
+        {
+            return ParseCleanupResult(SendCommand(profile, "SERVICE_START", null));
+        }
+
+        internal static ServerCacheCleanup.CleanupResult ServiceStop(ServerProfile profile)
+        {
+            return ParseCleanupResult(SendCommand(profile, "SERVICE_STOP", null));
+        }
+
+        internal static ServerCacheCleanup.CleanupResult ServiceRestart(ServerProfile profile)
+        {
+            return ParseCleanupResult(SendCommand(profile, "SERVICE_RESTART", null));
+        }
+
+        internal static Dictionary<string, string> ServiceStatus(ServerProfile profile)
+        {
+            RemoteProtocol.ParsedMessage resp = SendCommand(profile, "SERVICE_STATUS", null);
+            Dictionary<string, string> statuses = new Dictionary<string, string>();
+            int n;
+            int.TryParse(resp.Get("count"), out n);
+            for (int i = 0; i < n; i++)
+            {
+                string[] f = RemoteProtocol.SplitFields(resp.Get("svc" + i));
+                if (f.Length < 2) continue;
+                statuses[f[0]] = (f[1].Length == 0) ? null : f[1];
+            }
+            return statuses;
+        }
+
+        internal static string SerializeSections(List<IbaseSection> sections)
+        {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < sections.Count; i++)
+            {
+                if (i > 0) sb.Append(RemoteProtocol.RecordSep);
+                IbaseSection s = sections[i];
+                string connect;
+                s.Props.TryGetValue("Connect", out connect);
+
+                StringBuilder extra = new StringBuilder();
+                bool first = true;
+                foreach (KeyValuePair<string, string> kv in s.Props)
+                {
+                    if (string.Equals(kv.Key, "Connect", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.Equals(kv.Key, "Folder", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!first) extra.Append(RemoteProtocol.ExtraKvSep);
+                    extra.Append(kv.Key).Append('=').Append(kv.Value);
+                    first = false;
+                }
+
+                sb.Append(RemoteProtocol.JoinFields(s.Name, s.Folder, s.IsDatabase ? "1" : "0",
+                    s.StartLine.ToString(), s.EndLine.ToString(), connect ?? "", extra.ToString()));
+            }
+            return sb.ToString();
+        }
+
+        internal static List<IbaseSection> DeserializeSectionsRaw(string data)
+        {
+            List<IbaseSection> result = new List<IbaseSection>();
+            if (string.IsNullOrEmpty(data)) return result;
+            foreach (string rec in data.Split(RemoteProtocol.RecordSep))
+            {
+                string[] f = RemoteProtocol.SplitFields(rec);
+                if (f.Length < 7) continue;
+                IbaseSection s = new IbaseSection();
+                s.Name = f[0];
+                int startLine, endLine;
+                int.TryParse(f[3], out startLine);
+                int.TryParse(f[4], out endLine);
+                s.StartLine = startLine;
+                s.EndLine = endLine;
+                s.Props["Folder"] = f[1];
+                bool isDb = f[2] == "1";
+                if (isDb) s.Props["Connect"] = f[5];
+                if (f[6].Length > 0)
+                {
+                    foreach (string pair in f[6].Split(RemoteProtocol.ExtraKvSep))
+                    {
+                        int eq = pair.IndexOf('=');
+                        if (eq > 0) s.Props[pair.Substring(0, eq)] = pair.Substring(eq + 1);
+                    }
+                }
+                result.Add(s);
+            }
+            return result;
+        }
+
+        internal static List<IbaseSection> IbaseList(ServerProfile profile, string userName)
+        {
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            fields["userName"] = userName;
+            RemoteProtocol.ParsedMessage resp = SendCommand(profile, "IBASE_LIST", fields);
+            return DeserializeSectionsRaw(resp.Get("sections"));
+        }
+
+        internal static IbaseFile.AddResult IbaseAdd(ServerProfile profile, string targetUserName, List<IbaseSection> selectedDbs, List<IbaseSection> sourceSections)
+        {
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            fields["userName"] = targetUserName;
+            fields["source"] = SerializeSections(sourceSections);
+            List<string> names = new List<string>();
+            foreach (IbaseSection s in selectedDbs) names.Add(s.Name);
+            fields["selected"] = string.Join(RemoteProtocol.FieldSep.ToString(), names.ToArray());
+
+            RemoteProtocol.ParsedMessage resp = SendCommand(profile, "IBASE_ADD", fields);
+            IbaseFile.AddResult result = new IbaseFile.AddResult();
+            int.TryParse(resp.Get("added"), out result.Added);
+            int.TryParse(resp.Get("skipped"), out result.Skipped);
+            return result;
+        }
+
+        internal static void IbaseDelete(ServerProfile profile, string userName, List<IbaseSection> toDelete)
+        {
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            fields["userName"] = userName;
+            fields["sections"] = SerializeSections(toDelete);
+            SendCommand(profile, "IBASE_DELETE", fields);
+        }
+    }
+
+    /// <summary>
+    /// Серверна сторона протоколу (розділ 5) - слухає TCP-порт у виділеному фоновому потоці й виконує ті самі
+    /// локальні дії, що й UI, повертаючи результат клієнту. Кожен запит обробляється синхронно в окремому потоці.
+    /// </summary>
+    internal class RemoteControlServer
+    {
+        private TcpListener _listener;
+        private System.Threading.Thread _acceptThread;
+        private volatile bool _running;
+        private string _user = "";
+        private string _password = "";
+        private int _port;
+
+        internal event EventHandler<RemoteActivityEventArgs> Activity;
+        private readonly System.Windows.Forms.Control _uiContext;
+
+        private static readonly Dictionary<string, List<DateTime>> _authFailures = new Dictionary<string, List<DateTime>>();
+        private static readonly object _authLock = new object();
+        private const int MaxFailuresPerWindow = 5;
+        private static readonly TimeSpan FailureWindow = TimeSpan.FromSeconds(60);
+
+        internal RemoteControlServer(System.Windows.Forms.Control uiContext)
+        {
+            _uiContext = uiContext;
+        }
+
+        internal bool IsRunning { get { return _running; } }
+        internal int Port { get { return _port; } }
+
+        internal string Start(int port, string user, string password)
+        {
+            if (_running) return null;
+            try
+            {
+                _listener = new TcpListener(IPAddress.Any, port);
+                _listener.Start();
+            }
+            catch (Exception ex)
+            {
+                return string.Format("Не вдалося почати прослуховування порту {0}: {1}", port, ex.Message);
+            }
+
+            _port = port;
+            _user = user ?? "";
+            _password = password ?? "";
+            _running = true;
+
+            _acceptThread = new System.Threading.Thread(AcceptLoop);
+            _acceptThread.IsBackground = true;
+            _acceptThread.Start();
+            return null;
+        }
+
+        internal void Stop()
+        {
+            _running = false;
+            try { if (_listener != null) _listener.Stop(); }
+            catch { /* не критично */ }
+            _listener = null;
+        }
+
+        private void AcceptLoop()
+        {
+            while (_running)
+            {
+                TcpClient client;
+                try
+                {
+                    client = _listener.AcceptTcpClient();
+                }
+                catch
+                {
+                    // Stop() вже виставив _running=false перед зупинкою листенера - це навмисне завершення.
+                    // Будь-яка інша помилка приймання (наприклад, транзиентний обрив з'єднання під час
+                    // хендшейку на реальній мережі) не повинна навсамкінець вбивати потік прийому - інакше
+                    // застосунок мовчки перестає приймати нові підключення, хоча тумблер і далі показує "Слухає".
+                    if (!_running) break;
+                    continue;
+                }
+
+                System.Threading.Thread t = new System.Threading.Thread(delegate() { HandleClient(client); });
+                t.IsBackground = true;
+                t.Start();
+            }
+        }
+
+        private void RaiseActivity(string text)
+        {
+            EventHandler<RemoteActivityEventArgs> handler = Activity;
+            if (handler == null || _uiContext == null) return;
+            try
+            {
+                if (_uiContext.IsHandleCreated && !_uiContext.IsDisposed)
+                {
+                    _uiContext.BeginInvoke(new Action(delegate { handler(this, new RemoteActivityEventArgs(text)); }));
+                }
+            }
+            catch
+            {
+                // форма могла закритись між перевіркою і викликом - не критично
+            }
+        }
+
+        private void HandleClient(TcpClient client)
+        {
+            string ip = "?";
+            try
+            {
+                IPEndPoint ep = client.Client.RemoteEndPoint as IPEndPoint;
+                if (ep != null) ip = ep.Address.ToString();
+
+                if (IsBlocked(ip))
+                {
+                    client.Close();
+                    return;
+                }
+
+                using (client)
+                using (NetworkStream stream = client.GetStream())
+                {
+                    stream.ReadTimeout = 20000;
+                    stream.WriteTimeout = 20000;
+
+                    byte[] requestEncrypted = RemoteProtocol.ReadFrame(stream, 32 * 1024 * 1024);
+                    byte[] key = RemoteProtocol.DeriveKey(_password);
+
+                    string requestPlain;
+                    try
+                    {
+                        requestPlain = RemoteProtocol.Decrypt(key, requestEncrypted);
+                    }
+                    catch
+                    {
+                        RecordFailure(ip);
+                        return; // невірний пароль профілю - тихо розриваємо з'єднання
+                    }
+
+                    RemoteProtocol.ParsedMessage request = RemoteProtocol.ParseMessage(requestPlain);
+                    if (!string.Equals(request.Get("user"), _user, StringComparison.Ordinal))
+                    {
+                        RecordFailure(ip);
+                        return;
+                    }
+
+                    RaiseActivity(string.Format("{0}: {1} від {2}", DateTime.Now.ToString("HH:mm:ss"), request.Command, ip));
+
+                    RemoteProtocol.ParsedMessage response = Dispatch(request);
+                    string responsePlain = RemoteProtocol.BuildMessage(response.Command, response.Fields);
+                    byte[] responseEncrypted = RemoteProtocol.Encrypt(key, responsePlain);
+                    RemoteProtocol.WriteFrame(stream, responseEncrypted);
+                }
+            }
+            catch
+            {
+                // з'єднання перервано / помилка вводу-виводу - не критично для сервера
+            }
+        }
+
+        private static bool IsBlocked(string ip)
+        {
+            lock (_authLock)
+            {
+                List<DateTime> list;
+                if (!_authFailures.TryGetValue(ip, out list)) return false;
+                DateTime cutoff = DateTime.UtcNow - FailureWindow;
+                list.RemoveAll(delegate(DateTime t) { return t < cutoff; });
+                return list.Count >= MaxFailuresPerWindow;
+            }
+        }
+
+        private static void RecordFailure(string ip)
+        {
+            lock (_authLock)
+            {
+                List<DateTime> list;
+                if (!_authFailures.TryGetValue(ip, out list))
+                {
+                    list = new List<DateTime>();
+                    _authFailures[ip] = list;
+                }
+                list.Add(DateTime.UtcNow);
+            }
+        }
+
+        private static string GetField(RemoteProtocol.ParsedMessage msg, string key)
+        {
+            return msg.Get(key);
+        }
+
+        private static List<int> ParseIds(string csv)
+        {
+            return RemoteClient.ParseIds(csv);
+        }
+
+        private RemoteProtocol.ParsedMessage Dispatch(RemoteProtocol.ParsedMessage request)
+        {
+            try
+            {
+                switch ((request.Command ?? "").ToUpperInvariant())
+                {
+                    case "LIST_SESSIONS": return HandleListSessions();
+                    case "SEND_MESSAGE": return HandleSendMessage(request);
+                    case "LOGOFF_SESSIONS": return HandleLogoffSessions(request);
+                    case "SHADOW_INFO": return HandleShadowInfo(request);
+                    case "TAKE_OVER": return HandleTakeOver(request);
+                    case "END_1C": return HandleEnd1C(request);
+                    case "CLEAR_CACHE_1C": return HandleClearCache1C(request);
+                    case "SERVER_CLEANUP": return CleanupResultResponse(ServerCacheCleanup.Run(true));
+                    case "SERVICE_START": return CleanupResultResponse(ServerCacheCleanup.StartServices());
+                    case "SERVICE_STOP": return CleanupResultResponse(ServerCacheCleanup.StopServices());
+                    case "SERVICE_RESTART": return CleanupResultResponse(ServerCacheCleanup.RestartServices());
+                    case "SERVICE_STATUS": return HandleServiceStatus();
+                    case "IBASE_LIST": return HandleIbaseList(request);
+                    case "IBASE_ADD": return HandleIbaseAdd(request);
+                    case "IBASE_DELETE": return HandleIbaseDelete(request);
+                    default: return ErrorResponse("Невідома команда: " + request.Command);
+                }
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse("Помилка на сервері: " + ex.Message);
+            }
+        }
+
+        private static RemoteProtocol.ParsedMessage OkResponse(Dictionary<string, string> fields)
+        {
+            RemoteProtocol.ParsedMessage msg = new RemoteProtocol.ParsedMessage();
+            msg.Command = "OK";
+            if (fields != null) foreach (KeyValuePair<string, string> kv in fields) msg.Fields[kv.Key] = kv.Value;
+            return msg;
+        }
+
+        private static RemoteProtocol.ParsedMessage ErrorResponse(string message)
+        {
+            RemoteProtocol.ParsedMessage msg = new RemoteProtocol.ParsedMessage();
+            msg.Command = "ERR";
+            msg.Fields["message"] = message;
+            return msg;
+        }
+
+        private static RemoteProtocol.ParsedMessage HandleListSessions()
+        {
+            List<RdpSession> sessions = MainForm.GetRdpSessions();
+            Dictionary<string, UserAccountInfo> cache = new Dictionary<string, UserAccountInfo>(StringComparer.OrdinalIgnoreCase);
+            foreach (RdpSession s in sessions)
+            {
+                string key = (string.IsNullOrEmpty(s.DomainName) ? "" : s.DomainName + "\\") + s.UserName;
+                UserAccountInfo info;
+                if (!cache.TryGetValue(key, out info))
+                {
+                    info = MainForm.GetUserAccountInfo(s.UserName, s.DomainName);
+                    cache[key] = info;
+                }
+                s.Description = info.Description;
+                s.FullName = info.FullName;
+            }
+
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            fields["count"] = sessions.Count.ToString();
+            for (int i = 0; i < sessions.Count; i++)
+            {
+                RdpSession s = sessions[i];
+                fields["session" + i] = RemoteProtocol.JoinFields(s.UserName, s.SessionName, s.Id, s.State,
+                    s.RawState.ToString(), s.OneCCount.ToString(), s.Description, s.FullName, s.DomainName);
+            }
+            return OkResponse(fields);
+        }
+
+        private static RemoteProtocol.ParsedMessage HandleSendMessage(RemoteProtocol.ParsedMessage request)
+        {
+            List<int> ids = ParseIds(GetField(request, "ids"));
+            string message = GetField(request, "message");
+            List<string> failed = MainForm.SendMessageToSessionsCore(ids, message);
+            if (failed.Count > 0) return ErrorResponse("Не вдалося надіслати повідомлення сеансу(ам): " + string.Join(", ", failed.ToArray()));
+            return OkResponse(null);
+        }
+
+        private static RemoteProtocol.ParsedMessage HandleLogoffSessions(RemoteProtocol.ParsedMessage request)
+        {
+            List<int> ids = ParseIds(GetField(request, "ids"));
+            List<string> failed = MainForm.LogoffSessionsCore(ids);
+            if (failed.Count > 0) return ErrorResponse("Не вдалося завершити сеанс(и) з ID: " + string.Join(", ", failed.ToArray()));
+            return OkResponse(null);
+        }
+
+        private static RemoteProtocol.ParsedMessage HandleShadowInfo(RemoteProtocol.ParsedMessage request)
+        {
+            int id;
+            int.TryParse(GetField(request, "id"), out id);
+            foreach (RdpSession s in MainForm.GetRdpSessions())
+            {
+                int sid;
+                if (int.TryParse(s.Id, out sid) && sid == id)
+                {
+                    Dictionary<string, string> f = new Dictionary<string, string>();
+                    f["userName"] = s.UserName;
+                    return OkResponse(f);
+                }
+            }
+            return ErrorResponse("Сеанс з ID " + id + " не знайдено на віддаленому сервері.");
+        }
+
+        private static RemoteProtocol.ParsedMessage HandleTakeOver(RemoteProtocol.ParsedMessage request)
+        {
+            int id;
+            int.TryParse(GetField(request, "id"), out id);
+            string destStation = GetField(request, "destStation");
+            string password = GetField(request, "targetPassword");
+            string error = MainForm.TakeOverCore(id, destStation, password);
+            if (error != null) return ErrorResponse(error);
+            return OkResponse(null);
+        }
+
+        private static RemoteProtocol.ParsedMessage HandleEnd1C(RemoteProtocol.ParsedMessage request)
+        {
+            List<int> ids = ParseIds(GetField(request, "ids"));
+            List<Process> processes = MainForm.GetOneCProcessesForSessions(ids);
+            if (processes.Count == 0) return OkResponse(null);
+            List<string> failed = MainForm.KillProcesses(processes);
+            if (failed.Count > 0) return ErrorResponse("Не вдалося завершити процес(и): " + string.Join(", ", failed.ToArray()));
+            return OkResponse(null);
+        }
+
+        private static RemoteProtocol.ParsedMessage HandleClearCache1C(RemoteProtocol.ParsedMessage request)
+        {
+            List<int> ids = ParseIds(GetField(request, "ids"));
+            string userNamesRaw = GetField(request, "userNames");
+            List<string> userNames = new List<string>(userNamesRaw.Split(RemoteProtocol.FieldSep));
+
+            List<Process> processes = MainForm.GetOneCProcessesForSessions(ids);
+            List<string> failedKill = MainForm.KillProcesses(processes);
+            if (processes.Count > 0) System.Threading.Thread.Sleep(1500);
+
+            List<string> cacheErrors = new List<string>();
+            foreach (string userName in userNames)
+            {
+                if (userName.Length == 0) continue;
+                try { MainForm.ClearOneCCache(userName); }
+                catch (Exception ex) { cacheErrors.Add(userName + ": " + ex.Message); }
+            }
+
+            MainForm.SendMessageToSessionsCore(ids, "Можна працювати.");
+
+            if (failedKill.Count > 0 || cacheErrors.Count > 0)
+            {
+                StringBuilder msg = new StringBuilder();
+                if (failedKill.Count > 0) msg.Append("Не вдалося завершити процес(и): ").Append(string.Join(", ", failedKill.ToArray())).Append(". ");
+                if (cacheErrors.Count > 0) msg.Append("Помилки очищення кешу: ").Append(string.Join("; ", cacheErrors.ToArray()));
+                return ErrorResponse(msg.ToString());
+            }
+            return OkResponse(null);
+        }
+
+        private static RemoteProtocol.ParsedMessage CleanupResultResponse(ServerCacheCleanup.CleanupResult result)
+        {
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            fields["processedCount"] = result.ServicesProcessed.Count.ToString();
+            for (int i = 0; i < result.ServicesProcessed.Count; i++) fields["processed" + i] = result.ServicesProcessed[i];
+            fields["errorCount"] = result.Errors.Count.ToString();
+            for (int i = 0; i < result.Errors.Count; i++) fields["error" + i] = result.Errors[i];
+            return OkResponse(fields);
+        }
+
+        private static RemoteProtocol.ParsedMessage HandleServiceStatus()
+        {
+            Dictionary<string, string> statuses = ServerCacheCleanup.GetServiceStatuses();
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            int i = 0;
+            foreach (KeyValuePair<string, string> kv in statuses)
+            {
+                fields["svc" + i] = RemoteProtocol.JoinFields(kv.Key, kv.Value ?? "");
+                i++;
+            }
+            fields["count"] = i.ToString();
+            return OkResponse(fields);
+        }
+
+        private static RemoteProtocol.ParsedMessage HandleIbaseList(RemoteProtocol.ParsedMessage request)
+        {
+            string userName = GetField(request, "userName");
+            string path = IbaseFile.GetPathForUser(userName);
+            List<IbaseSection> sections = IbaseFile.ParseFile(path);
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            fields["sections"] = RemoteClient.SerializeSections(sections);
+            return OkResponse(fields);
+        }
+
+        private static RemoteProtocol.ParsedMessage HandleIbaseAdd(RemoteProtocol.ParsedMessage request)
+        {
+            string userName = GetField(request, "userName");
+            List<IbaseSection> sourceSections = RemoteClient.DeserializeSectionsRaw(GetField(request, "source"));
+            List<string> selectedNames = new List<string>(GetField(request, "selected").Split(RemoteProtocol.FieldSep));
+
+            List<IbaseSection> selectedDbs = new List<IbaseSection>();
+            foreach (IbaseSection s in sourceSections)
+            {
+                if (s.IsDatabase && selectedNames.Contains(s.Name)) selectedDbs.Add(s);
+            }
+
+            string targetPath = IbaseFile.GetPathForUser(userName);
+            IbaseFile.AddResult result = IbaseFile.AddDatabases(targetPath, selectedDbs, sourceSections);
+
+            Dictionary<string, string> fields = new Dictionary<string, string>();
+            fields["added"] = result.Added.ToString();
+            fields["skipped"] = result.Skipped.ToString();
+            return OkResponse(fields);
+        }
+
+        private static RemoteProtocol.ParsedMessage HandleIbaseDelete(RemoteProtocol.ParsedMessage request)
+        {
+            string userName = GetField(request, "userName");
+            List<IbaseSection> toDelete = RemoteClient.DeserializeSectionsRaw(GetField(request, "sections"));
+            string path = IbaseFile.GetPathForUser(userName);
+            IbaseFile.DeleteSections(path, toDelete);
+            return OkResponse(null);
+        }
+    }
+
+    internal class RemoteActivityEventArgs : EventArgs
+    {
+        public readonly string Text;
+        public RemoteActivityEventArgs(string text) { Text = text; }
+    }
+
     internal class MainForm : Form
     {
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -581,8 +1761,18 @@ namespace ShadowSessionTool
         private string _pendingUpdateVersion;
         private string _externalIp;
 
+        // --- Профілі серверів / віддалене керування (розділи 2-6) ---
+        private Button btnServers;
+        private Label lblRemoteBanner;
+        private Button btnGoLocal;
+        private readonly List<Label> _serviceStatusLabels = new List<Label>();
+        private ServerProfile _activeRemote;
+        private readonly RemoteControlServer _remoteServer;
+        private ServerManagerForm _serverManagerForm;
+
         public MainForm()
         {
+            _remoteServer = new RemoteControlServer(this);
             InitializeComponent();
             KeyPreview = true;
             KeyDown += (s, e) =>
@@ -591,18 +1781,36 @@ namespace ShadowSessionTool
                 {
                     RefreshSessions();
                     RefreshPolicyStatus();
+                    RefreshServiceStatusLabels();
                 }
             };
+            FormClosing += (s, e) => { try { _remoteServer.Stop(); } catch { } };
             Shown += (s, e) =>
             {
                 SendMessage(txtSearch.Handle, EM_SETCUEBANNER, IntPtr.Zero, "Пошук за користувачем/описом/іменем...");
                 ApplyTheme(LoadSavedTheme());
                 RefreshSessions();
                 RefreshPolicyStatus();
+                RefreshServiceStatusLabels();
                 CheckForUpdatesAsync();
                 ShowLocalIp();
                 FetchExternalIpAsync();
+                StartRemoteControlIfEnabled();
             };
+        }
+
+        private void StartRemoteControlIfEnabled()
+        {
+            ServerProfileStore.RemoteControlSettings settings = ServerProfileStore.LoadRemoteControlSettings();
+            if (!settings.Enabled) return;
+
+            string error = _remoteServer.Start(settings.Port, settings.User, settings.Password);
+            if (error != null)
+            {
+                MessageBox.Show(this,
+                    "Не вдалося увімкнути \"Дозволити керування\" при запуску: " + error,
+                    "Дозволити керування", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
 
         private void InitializeComponent()
@@ -665,7 +1873,7 @@ namespace ShadowSessionTool
             const int btnW = 165, btnH = 28, colB = 348, colRight = 523;
 
             btnRefresh = new Button { Text = "", Size = new Size(40, 28), Location = new Point(298, 40), Anchor = AnchorStyles.Top | AnchorStyles.Right };
-            btnRefresh.Click += (s, e) => { RefreshSessions(); RefreshPolicyStatus(); };
+            btnRefresh.Click += (s, e) => { RefreshSessions(); RefreshPolicyStatus(); RefreshServiceStatusLabels(); };
             themeToolTip.SetToolTip(btnRefresh, "Оновити (F5)");
 
             btnServerCache = new Button
@@ -676,6 +1884,13 @@ namespace ShadowSessionTool
                 Anchor = AnchorStyles.Top | AnchorStyles.Right
             };
 
+            ToolStripMenuItem miStartServices = new ToolStripMenuItem("Запустити служби 1С/BAF");
+            miStartServices.Click += MiStartServices_Click;
+            ToolStripMenuItem miStopServices = new ToolStripMenuItem("Зупинити служби 1С/BAF");
+            miStopServices.Click += MiStopServices_Click;
+            ToolStripMenuItem miRestartServices = new ToolStripMenuItem("Перезапустити служби 1С/BAF");
+            miRestartServices.Click += MiRestartServices_Click;
+
             ToolStripMenuItem miDoServerCleanup = new ToolStripMenuItem("Очистити серверний кеш 1С");
             miDoServerCleanup.Click += MiServerCacheCleanup_Click;
             ToolStripMenuItem miScheduleServerCleanup = new ToolStripMenuItem("Запланувати очищення...");
@@ -684,12 +1899,49 @@ namespace ShadowSessionTool
             miCancelScheduleServerCleanup.Click += MiCancelScheduledCleanup_Click;
 
             serverCacheMenu = new ContextMenuStrip();
+            serverCacheMenu.Items.Add(miStartServices);
+            serverCacheMenu.Items.Add(miStopServices);
+            serverCacheMenu.Items.Add(miRestartServices);
+            serverCacheMenu.Items.Add(new ToolStripSeparator());
             serverCacheMenu.Items.Add(miDoServerCleanup);
             serverCacheMenu.Items.Add(new ToolStripSeparator());
             serverCacheMenu.Items.Add(miScheduleServerCleanup);
             serverCacheMenu.Items.Add(miCancelScheduleServerCleanup);
 
             btnServerCache.Click += (s, e) => serverCacheMenu.Show(btnServerCache, new Point(0, btnServerCache.Height));
+
+            btnServers = new Button
+            {
+                Text = "⚙",
+                Size = new Size(26, 20),
+                Location = new Point(520, 9),
+                FlatStyle = FlatStyle.Flat,
+                Anchor = AnchorStyles.Top | AnchorStyles.Right
+            };
+            btnServers.FlatAppearance.BorderColor = Color.Gray;
+            btnServers.Click += BtnServers_Click;
+            themeToolTip.SetToolTip(btnServers, "Сервери... (профілі та віддалене керування)");
+
+            lblRemoteBanner = new Label
+            {
+                AutoSize = true,
+                MaximumSize = new Size(500, 0),
+                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                Location = new Point(12, 68),
+                ForeColor = Color.DarkOrange,
+                Visible = false,
+                Text = ""
+            };
+
+            btnGoLocal = new Button
+            {
+                Text = "Локально",
+                Size = new Size(76, 22),
+                Location = new Point(600, 65),
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                Visible = false
+            };
+            btnGoLocal.Click += BtnGoLocal_Click;
 
             btnReboot = new Button
             {
@@ -853,6 +2105,9 @@ namespace ShadowSessionTool
             Controls.Add(lblSelect);
             Controls.Add(btnRefresh);
             Controls.Add(btnServerCache);
+            Controls.Add(btnServers);
+            Controls.Add(lblRemoteBanner);
+            Controls.Add(btnGoLocal);
             Controls.Add(pnlIndicator);
             Controls.Add(lblStatus);
             Controls.Add(btnEnablePolicy);
@@ -938,6 +2193,7 @@ namespace ShadowSessionTool
 
         private bool IsOwnSessionSelected()
         {
+            if (_activeRemote != null) return false; // ID сеансів на віддаленому сервері не пов'язані з _ownSessionId цієї машини
             if (lvSessions.SelectedItems.Count != 1) return false;
             int id;
             if (!int.TryParse(lvSessions.SelectedItems[0].SubItems[2].Text, out id)) return false;
@@ -966,7 +2222,7 @@ namespace ShadowSessionTool
             }
 
             int idNum;
-            if (int.TryParse(id, out idNum) && idNum == _ownSessionId)
+            if (int.TryParse(id, out idNum) && _activeRemote == null && idNum == _ownSessionId)
             {
                 MessageBox.Show(this, "Не можна підключитися до власного сеансу.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
@@ -974,18 +2230,43 @@ namespace ShadowSessionTool
 
             int? policyValue = GetShadowPolicyValue();
             bool noConsent = policyValue.HasValue && policyValue.Value == DesiredValue;
-            string args = noConsent
-                ? string.Format("/shadow:{0} /control /noConsentPrompt", id)
-                : string.Format("/shadow:{0} /control", id);
 
-            try
+            if (_activeRemote == null)
             {
-                Process.Start("mstsc.exe", args);
+                string args = noConsent
+                    ? string.Format("/shadow:{0} /control /noConsentPrompt", id)
+                    : string.Format("/shadow:{0} /control", id);
+
+                try
+                {
+                    Process.Start("mstsc.exe", args);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, "Не вдалося запустити підключення: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                return;
             }
-            catch (Exception ex)
-            {
-                MessageBox.Show(this, "Не вдалося запустити підключення: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
+
+            // Розділ 6, "Особливості": тіньове підключення виконує mstsc.exe локально на сервері 1, з /v:<host> -
+            // SHADOW_INFO лише перевіряє на сервері 2, що сеанс існує.
+            ServerProfile profile = _activeRemote;
+            RunRemoteAction(
+                delegate { RemoteClient.ShadowInfo(profile, idNum); },
+                delegate
+                {
+                    string args = noConsent
+                        ? string.Format("/shadow:{0} /v:{1} /control /noConsentPrompt", id, profile.Host)
+                        : string.Format("/shadow:{0} /v:{1} /control", id, profile.Host);
+                    try
+                    {
+                        Process.Start("mstsc.exe", args);
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show(this, "Не вдалося запустити підключення: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                });
         }
 
         private void MiCtxTakeOver_Click(object sender, EventArgs e)
@@ -999,7 +2280,7 @@ namespace ShadowSessionTool
             int id;
             if (!int.TryParse(lvSessions.SelectedItems[0].SubItems[2].Text, out id)) return;
 
-            if (id == _ownSessionId)
+            if (_activeRemote == null && id == _ownSessionId)
             {
                 MessageBox.Show(this, "Не можна перейняти власний сеанс.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
@@ -1008,25 +2289,52 @@ namespace ShadowSessionTool
             string userName = lvSessions.SelectedItems[0].Text;
 
             DialogResult confirm = MessageBox.Show(this,
-                string.Format("Ваш поточний сеанс буде замінено сеансом користувача \"{0}\" (як команда \"Підключити\" в Диспетчері завдань). " +
-                    "Це не тіньовий перегляд — ваш власний робочий стіл стане недоступний, поки ви не повернетесь назад. Продовжити?", userName),
+                string.Format("Поточний сеанс на {0} буде замінено сеансом користувача \"{1}\" (як команда \"Підключити\" в Диспетчері завдань). " +
+                    "Це не тіньовий перегляд — робочий стіл, до якого підключається команда, стане недоступний, поки ви не повернетесь назад. Продовжити?",
+                    _activeRemote == null ? "цьому комп'ютері" : _activeRemote.Name, userName),
                 "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (confirm != DialogResult.Yes) return;
 
             string password = ShowInputDialog(string.Format("Пароль користувача \"{0}\":", userName), "Перейняти сеанс", true);
             if (password == null) return;
 
-            string ownStation = GetSessionStationName(_ownSessionId);
-            if (string.IsNullOrEmpty(ownStation))
+            if (_activeRemote == null)
             {
-                MessageBox.Show(this, "Не вдалося визначити назву поточного сеансу.", "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                string ownStation = GetSessionStationName(_ownSessionId);
+                if (string.IsNullOrEmpty(ownStation))
+                {
+                    MessageBox.Show(this, "Не вдалося визначити назву поточного сеансу.", "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                string error = TakeOverCore(id, ownStation, password);
+                if (error != null)
+                {
+                    MessageBox.Show(this, error, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
                 return;
             }
 
+            // Віддалено: сервер 2 не може автоматично визначити назву консольної станції адміністратора,
+            // яка живе на сервері 1 - її потрібно вказати вручну (мається на увазі станція, з якої
+            // адміністратор УЖЕ під'єднаний до сервера 2, наприклад через попередній тіньовий сеанс/RDP).
+            string destStation = ShowInputDialog(
+                "Назва станції (WinStation) на сервері \"" + _activeRemote.Name + "\", куди перейняти сеанс.\n" +
+                "Дізнатися можна в Диспетчері завдань → вкладка Користувачі на самому сервері 2, стовпець \"Сеанс\".",
+                "Перейняти сеанс (віддалено)", false);
+            if (string.IsNullOrEmpty(destStation)) return;
+
+            ServerProfile profile = _activeRemote;
+            RunRemoteAction(delegate { RemoteClient.TakeOver(profile, id, destStation, password); }, null);
+        }
+
+        /// <summary>Без UI-побічних дій - переюзається сервером віддаленого керування (розділ 5/6). Повертає повідомлення про помилку або null.</summary>
+        internal static string TakeOverCore(int sessionId, string destStation, string password)
+        {
             try
             {
                 ProcessStartInfo psi = new ProcessStartInfo("tscon.exe",
-                    string.Format("{0} /dest:{1} /password:{2}", id, ownStation, password))
+                    string.Format("{0} /dest:{1} /password:{2}", sessionId, destStation, password))
                 {
                     UseShellExecute = false,
                     CreateNoWindow = true,
@@ -1039,19 +2347,18 @@ namespace ShadowSessionTool
                     if (p.ExitCode != 0)
                     {
                         string err = p.StandardError.ReadToEnd().Trim();
-                        MessageBox.Show(this,
-                            "Не вдалося перейняти сеанс (код " + p.ExitCode + ")." + (string.IsNullOrEmpty(err) ? "" : "\n" + err),
-                            "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        return "Не вдалося перейняти сеанс (код " + p.ExitCode + ")." + (string.IsNullOrEmpty(err) ? "" : "\n" + err);
                     }
                 }
+                return null;
             }
             catch (Exception ex)
             {
-                MessageBox.Show(this, "Не вдалося перейняти сеанс: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return "Не вдалося перейняти сеанс: " + ex.Message;
             }
         }
 
-        private string GetSessionStationName(int sessionId)
+        internal static string GetSessionStationName(int sessionId)
         {
             IntPtr buffer;
             int bytesReturned;
@@ -1094,8 +2401,7 @@ namespace ShadowSessionTool
             DialogResult confirm = MessageBox.Show(this, confirmText, "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (confirm != DialogResult.Yes) return;
 
-            LogoffSessions(ids);
-            RefreshSessions();
+            LogoffSessionsDispatch(ids);
         }
 
         private void BtnDisconnectAll_Click(object sender, EventArgs e)
@@ -1119,11 +2425,36 @@ namespace ShadowSessionTool
                 "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (confirm != DialogResult.Yes) return;
 
-            LogoffSessions(ids);
-            RefreshSessions();
+            LogoffSessionsDispatch(ids);
         }
 
         private void LogoffSessions(List<int> ids)
+        {
+            List<string> failed = LogoffSessionsCore(ids);
+
+            if (failed.Count > 0)
+            {
+                MessageBox.Show(this, "Не вдалося завершити сеанс(и) з ID: " + string.Join(", ", failed.ToArray()), "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void LogoffSessionsDispatch(List<int> ids)
+        {
+            if (_activeRemote == null)
+            {
+                LogoffSessions(ids);
+                RefreshSessions();
+                return;
+            }
+
+            ServerProfile profile = _activeRemote;
+            RunRemoteAction(
+                delegate { RemoteClient.LogoffSessions(profile, ids); },
+                delegate { RefreshSessions(); });
+        }
+
+        /// <summary>Без UI-побічних дій - переюзається сервером віддаленого керування (розділ 5/6).</summary>
+        internal static List<string> LogoffSessionsCore(List<int> ids)
         {
             List<string> failed = new List<string>();
             foreach (int id in ids)
@@ -1133,14 +2464,10 @@ namespace ShadowSessionTool
                     failed.Add(id.ToString());
                 }
             }
-
-            if (failed.Count > 0)
-            {
-                MessageBox.Show(this, "Не вдалося завершити сеанс(и) з ID: " + string.Join(", ", failed.ToArray()), "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
+            return failed;
         }
 
-        private static List<Process> GetOneCProcessesForSessions(List<int> sessionIds)
+        internal static List<Process> GetOneCProcessesForSessions(List<int> sessionIds)
         {
             List<Process> processes = new List<Process>();
             foreach (Process p in Process.GetProcesses())
@@ -1157,7 +2484,7 @@ namespace ShadowSessionTool
             return processes;
         }
 
-        private static List<string> KillProcesses(List<Process> processes)
+        internal static List<string> KillProcesses(List<Process> processes)
         {
             List<string> failed = new List<string>();
             foreach (Process p in processes)
@@ -1186,27 +2513,42 @@ namespace ShadowSessionTool
             }
             if (ids.Count == 0) return;
 
-            List<Process> processes = GetOneCProcessesForSessions(ids);
-
-            if (processes.Count == 0)
+            if (_activeRemote == null)
             {
-                MessageBox.Show(this, "У вибраних сеансах немає запущених процесів 1С/BAS.", "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                List<Process> processes = GetOneCProcessesForSessions(ids);
+
+                if (processes.Count == 0)
+                {
+                    MessageBox.Show(this, "У вибраних сеансах немає запущених процесів 1С/BAS.", "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                DialogResult confirm = MessageBox.Show(this,
+                    string.Format("Завершити {0} процес(и) 1С/BAS у вибраних сеансах? Незбережені дані користувачів буде втрачено.", processes.Count),
+                    "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                if (confirm != DialogResult.Yes) return;
+
+                List<string> failed = KillProcesses(processes);
+
+                if (failed.Count > 0)
+                {
+                    MessageBox.Show(this, "Не вдалося завершити процес(и): " + string.Join(", ", failed.ToArray()), "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+
+                RefreshSessions();
                 return;
             }
 
-            DialogResult confirm = MessageBox.Show(this,
-                string.Format("Завершити {0} процес(и) 1С/BAS у вибраних сеансах? Незбережені дані користувачів буде втрачено.", processes.Count),
+            // Віддалено ми не можемо синхронно дізнатись кількість процесів наперед без окремого запиту - підтверджуємо узагальнено.
+            DialogResult confirmRemote = MessageBox.Show(this,
+                string.Format("Завершити процеси 1С/BAS у вибраних сеансах на сервері \"{0}\"? Незбережені дані користувачів буде втрачено.", _activeRemote.Name),
                 "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
-            if (confirm != DialogResult.Yes) return;
+            if (confirmRemote != DialogResult.Yes) return;
 
-            List<string> failed = KillProcesses(processes);
-
-            if (failed.Count > 0)
-            {
-                MessageBox.Show(this, "Не вдалося завершити процес(и): " + string.Join(", ", failed.ToArray()), "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-
-            RefreshSessions();
+            ServerProfile profileEnd1C = _activeRemote;
+            RunRemoteAction(
+                delegate { RemoteClient.End1C(profileEnd1C, ids); },
+                delegate { RefreshSessions(); });
         }
 
         private void MiCtxClearCache1C_Click(object sender, EventArgs e)
@@ -1236,43 +2578,56 @@ namespace ShadowSessionTool
                 "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (confirm != DialogResult.Yes) return;
 
-            List<Process> processes = GetOneCProcessesForSessions(ids);
-            List<string> failedKill = KillProcesses(processes);
-            if (processes.Count > 0) System.Threading.Thread.Sleep(1500);
-
-            List<string> cacheErrors = new List<string>();
-            foreach (string userName in userNames)
+            if (_activeRemote == null)
             {
-                try
+                List<Process> processes = GetOneCProcessesForSessions(ids);
+                List<string> failedKill = KillProcesses(processes);
+                if (processes.Count > 0) System.Threading.Thread.Sleep(1500);
+
+                List<string> cacheErrors = new List<string>();
+                foreach (string userName in userNames)
                 {
-                    ClearOneCCache(userName);
+                    try
+                    {
+                        ClearOneCCache(userName);
+                    }
+                    catch (Exception ex)
+                    {
+                        cacheErrors.Add(userName + ": " + ex.Message);
+                    }
                 }
-                catch (Exception ex)
+
+                SendMessageToSessions(ids, "Можна працювати.");
+                RefreshSessions();
+
+                if (failedKill.Count > 0 || cacheErrors.Count > 0)
                 {
-                    cacheErrors.Add(userName + ": " + ex.Message);
+                    StringBuilder msg = new StringBuilder();
+                    if (failedKill.Count > 0) msg.AppendLine("Не вдалося завершити процес(и): " + string.Join(", ", failedKill.ToArray()));
+                    if (cacheErrors.Count > 0) msg.AppendLine("Помилки очищення кешу: " + string.Join("; ", cacheErrors.ToArray()));
+                    MessageBox.Show(this, msg.ToString(), "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
+                else
+                {
+                    MessageBox.Show(this, "Готово: сеанси 1С завершено, кеш очищено, користувачів повідомлено.", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                return;
             }
 
-            SendMessageToSessions(ids, "Можна працювати.");
-            RefreshSessions();
-
-            if (failedKill.Count > 0 || cacheErrors.Count > 0)
-            {
-                StringBuilder msg = new StringBuilder();
-                if (failedKill.Count > 0) msg.AppendLine("Не вдалося завершити процес(и): " + string.Join(", ", failedKill.ToArray()));
-                if (cacheErrors.Count > 0) msg.AppendLine("Помилки очищення кешу: " + string.Join("; ", cacheErrors.ToArray()));
-                MessageBox.Show(this, msg.ToString(), "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-            else
-            {
-                MessageBox.Show(this, "Готово: сеанси 1С завершено, кеш очищено, користувачів повідомлено.", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
+            ServerProfile profileClearCache = _activeRemote;
+            RunRemoteAction(
+                delegate { RemoteClient.ClearCache1C(profileClearCache, ids, userNames); },
+                delegate
+                {
+                    RefreshSessions();
+                    MessageBox.Show(this, "Готово: сеанси 1С завершено, кеш очищено, користувачів повідомлено.", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                });
         }
 
         private static readonly string[] OneCVersionFolders = { "1Cv8", "1Cv82" };
         private static readonly string[] OneCCacheFoldersToDelete = { "Config", "ConfigSave", "DBNameCache", "SICache", "vrs-cache" };
 
-        private static void ClearOneCCache(string userName)
+        internal static void ClearOneCCache(string userName)
         {
             int slashIdx = userName.IndexOf('\\');
             string plainUserName = slashIdx >= 0 ? userName.Substring(slashIdx + 1) : userName;
@@ -1361,22 +2716,48 @@ namespace ShadowSessionTool
                 "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             if (confirmAdd != DialogResult.Yes) return;
 
-            StringBuilder summary = new StringBuilder();
-            foreach (string userName in targetUsers)
+            if (_activeRemote == null)
             {
-                string targetPath = IbaseFile.GetPathForUser(userName);
-                try
+                StringBuilder summary = new StringBuilder();
+                foreach (string userName in targetUsers)
                 {
-                    IbaseFile.AddResult r = IbaseFile.AddDatabases(targetPath, dbsOnly, sourceSections);
-                    summary.AppendLine(string.Format("{0}: додано {1}, пропущено (вже є) {2}", userName, r.Added, r.Skipped));
+                    string targetPath = IbaseFile.GetPathForUser(userName);
+                    try
+                    {
+                        IbaseFile.AddResult r = IbaseFile.AddDatabases(targetPath, dbsOnly, sourceSections);
+                        summary.AppendLine(string.Format("{0}: додано {1}, пропущено (вже є) {2}", userName, r.Added, r.Skipped));
+                    }
+                    catch (Exception ex)
+                    {
+                        summary.AppendLine(string.Format("{0}: помилка — {1}", userName, ex.Message));
+                    }
                 }
-                catch (Exception ex)
-                {
-                    summary.AppendLine(string.Format("{0}: помилка — {1}", userName, ex.Message));
-                }
+
+                MessageBox.Show(this, summary.ToString(), "Додавання баз 1С", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
             }
 
-            MessageBox.Show(this, summary.ToString(), "Додавання баз 1С", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            // Джерело (власний список 1С адміністратора) завжди читається локально - воно на машині, де запущено застосунок;
+            // лише запис у список цільового користувача виконується на сервері 2 (IBASE_ADD).
+            ServerProfile profile = _activeRemote;
+            StringBuilder remoteSummary = new StringBuilder();
+            RunRemoteAction(
+                delegate
+                {
+                    foreach (string userName in targetUsers)
+                    {
+                        try
+                        {
+                            IbaseFile.AddResult r = RemoteClient.IbaseAdd(profile, userName, dbsOnly, sourceSections);
+                            remoteSummary.AppendLine(string.Format("{0}: додано {1}, пропущено (вже є) {2}", userName, r.Added, r.Skipped));
+                        }
+                        catch (Exception ex)
+                        {
+                            remoteSummary.AppendLine(string.Format("{0}: помилка — {1}", userName, ex.Message));
+                        }
+                    }
+                },
+                delegate { MessageBox.Show(this, remoteSummary.ToString(), "Додавання баз 1С — " + profile.Name, MessageBoxButtons.OK, MessageBoxIcon.Information); });
         }
 
         private void MiViewUserDatabases_Click(object sender, EventArgs e)
@@ -1388,26 +2769,42 @@ namespace ShadowSessionTool
             }
 
             string userName = lvSessions.SelectedItems[0].Text;
-            string path = IbaseFile.GetPathForUser(userName);
 
-            if (!File.Exists(path))
+            if (_activeRemote == null)
             {
-                MessageBox.Show(this, string.Format("У користувача \"{0}\" ще немає списку баз 1С.", userName),
-                    "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                string path = IbaseFile.GetPathForUser(userName);
+
+                if (!File.Exists(path))
+                {
+                    MessageBox.Show(this, string.Format("У користувача \"{0}\" ще немає списку баз 1С.", userName),
+                        "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                List<IbaseSection> sections;
+                try
+                {
+                    sections = IbaseFile.Parse(File.ReadAllLines(path, Encoding.UTF8));
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, "Не вдалося прочитати файл: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                ShowIbaseTreeAndDeleteLocal(userName, sections, path);
                 return;
             }
 
-            List<IbaseSection> sections;
-            try
-            {
-                sections = IbaseFile.Parse(File.ReadAllLines(path, Encoding.UTF8));
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show(this, "Не вдалося прочитати файл: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
-            }
+            ServerProfile profile = _activeRemote;
+            List<IbaseSection> remoteSections = null;
+            RunRemoteAction(
+                delegate { remoteSections = RemoteClient.IbaseList(profile, userName); },
+                delegate { ShowIbaseTreeAndDeleteRemote(profile, userName, remoteSections); });
+        }
 
+        private void ShowIbaseTreeAndDeleteLocal(string userName, List<IbaseSection> sections, string path)
+        {
             if (sections.Count == 0)
             {
                 MessageBox.Show(this, "Список баз порожній.", "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1436,6 +2833,34 @@ namespace ShadowSessionTool
             {
                 MessageBox.Show(this, "Не вдалося зберегти зміни: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        private void ShowIbaseTreeAndDeleteRemote(ServerProfile profile, string userName, List<IbaseSection> sections)
+        {
+            if (sections == null || sections.Count == 0)
+            {
+                MessageBox.Show(this,
+                    string.Format("Список баз порожній (або у користувача \"{0}\" ще немає списку баз 1С) на сервері \"{1}\".", userName, profile.Name),
+                    "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            List<IbaseSection> toDelete = ShowIbaseTreeDialog(
+                string.Format("Список баз 1С — {0} ({1})", userName, profile.Name),
+                sections,
+                "Видалити",
+                "Позначте застарілі записи (або теки) для видалення зі списку баз користувача:");
+            if (toDelete == null || toDelete.Count == 0) return;
+
+            DialogResult confirmDelete = MessageBox.Show(this,
+                string.Format("Видалити {0} запис(ів) зі списку баз користувача \"{1}\" на сервері \"{2}\"?\n\nЦе прибирає їх лише зі стартового списку 1С, самі бази даних не видаляються.",
+                    toDelete.Count, userName, profile.Name),
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (confirmDelete != DialogResult.Yes) return;
+
+            RunRemoteAction(
+                delegate { RemoteClient.IbaseDelete(profile, userName, toDelete); },
+                delegate { MessageBox.Show(this, "Видалено.", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information); });
         }
 
         private List<IbaseSection> ShowIbaseTreeDialog(string title, List<IbaseSection> sections, string actionButtonText, string hintText)
@@ -1604,46 +3029,92 @@ namespace ShadowSessionTool
                 "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (confirm != DialogResult.Yes) return;
 
-            List<int> ids = new List<int>();
-            foreach (RdpSession s in _allSessions)
-            {
-                int id;
-                if (int.TryParse(s.Id, out id) && id != _ownSessionId) ids.Add(id);
-            }
-
-            if (ids.Count > 0)
-            {
-                SendMessageToSessions(ids, "Через 30 секунд розпочнеться технічне обслуговування сервера 1С/BAF. Будь ласка, збережіть роботу.");
-            }
+            List<int> ids = CollectOtherSessionIds();
+            WarnSessionsFireAndForget(ids, "Через 30 секунд розпочнеться технічне обслуговування сервера 1С/BAF. Будь ласка, збережіть роботу.");
 
             if (ShowCountdownDialog(30)) return;
 
             btnServerCache.Enabled = false;
-            Cursor = Cursors.WaitCursor;
 
+            if (_activeRemote == null)
+            {
+                Cursor = Cursors.WaitCursor;
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    ServerCacheCleanup.CleanupResult result = ServerCacheCleanup.Run(true);
+
+                    if (IsHandleCreated && !IsDisposed)
+                    {
+                        BeginInvoke(new Action(delegate
+                        {
+                            Cursor = Cursors.Default;
+                            btnServerCache.Enabled = true;
+                            if (ids.Count > 0) SendMessageToSessions(ids, "Можна працювати.");
+                            ShowServerCleanupResult(result, "Очищення серверного кешу 1С");
+                            RefreshSessions();
+                        }));
+                    }
+                });
+            }
+            else
+            {
+                ServerProfile profile = _activeRemote;
+                ServerCacheCleanup.CleanupResult result = null;
+                RunRemoteAction(
+                    delegate
+                    {
+                        result = RemoteClient.ServerCleanup(profile);
+                        if (ids.Count > 0)
+                        {
+                            try { RemoteClient.SendMessage(profile, ids, "Можна працювати."); }
+                            catch { /* не критично - основна дія вже виконана */ }
+                        }
+                    },
+                    delegate
+                    {
+                        btnServerCache.Enabled = true;
+                        ShowServerCleanupResult(result, "Очищення серверного кешу 1С — " + profile.Name);
+                        RefreshSessions();
+                    });
+            }
+        }
+
+        /// <summary>ID сеансів, крім власного (для локального обслуговування) - при активному remote-профілі власного сеансу серед них немає, тож фільтр не шкодить.</summary>
+        private List<int> CollectOtherSessionIds()
+        {
+            List<int> ids = new List<int>();
+            foreach (RdpSession s in _allSessions)
+            {
+                int id;
+                if (int.TryParse(s.Id, out id) && (_activeRemote != null || id != _ownSessionId)) ids.Add(id);
+            }
+            return ids;
+        }
+
+        /// <summary>Попередження перед відліком - для локального сервера синхронно (швидкий локальний виклик), для віддаленого - у фоні без очікування (не критично, якщо не дійде).</summary>
+        private void WarnSessionsFireAndForget(List<int> ids, string message)
+        {
+            if (ids.Count == 0) return;
+
+            if (_activeRemote == null)
+            {
+                SendMessageToSessions(ids, message);
+                return;
+            }
+
+            ServerProfile profile = _activeRemote;
             System.Threading.ThreadPool.QueueUserWorkItem(delegate
             {
-                ServerCacheCleanup.CleanupResult result = ServerCacheCleanup.Run(true);
-
-                if (IsHandleCreated && !IsDisposed)
-                {
-                    BeginInvoke(new Action(delegate
-                    {
-                        Cursor = Cursors.Default;
-                        btnServerCache.Enabled = true;
-                        if (ids.Count > 0) SendMessageToSessions(ids, "Можна працювати.");
-                        ShowServerCleanupResult(result);
-                        RefreshSessions();
-                    }));
-                }
+                try { RemoteClient.SendMessage(profile, ids, message); }
+                catch { /* не критично - це лише попередження */ }
             });
         }
 
-        private void ShowServerCleanupResult(ServerCacheCleanup.CleanupResult result)
+        private void ShowServerCleanupResult(ServerCacheCleanup.CleanupResult result, string title)
         {
             StringBuilder sb = new StringBuilder();
             foreach (string s in result.ServicesProcessed) sb.AppendLine(s);
-            if (result.ServicesProcessed.Count > 0)
+            if (result.ServicesProcessed.Count > 0 && result.FoldersDeleted.Count > 0)
             {
                 sb.AppendLine(string.Format("Видалено тек кешу: {0}", result.FoldersDeleted.Count));
             }
@@ -1655,8 +3126,163 @@ namespace ShadowSessionTool
             }
             if (sb.Length == 0) sb.Append("Готово.");
 
-            MessageBox.Show(this, sb.ToString(), "Очищення серверного кешу 1С",
+            MessageBox.Show(this, sb.ToString(), title,
                 MessageBoxButtons.OK, result.Errors.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+        }
+
+        private void MiStartServices_Click(object sender, EventArgs e)
+        {
+            // Незворотньо-безпечна дія (лише запуск) - без попередження й відліку, за планом.
+            if (_activeRemote == null)
+            {
+                btnServerCache.Enabled = false;
+                Cursor = Cursors.WaitCursor;
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    ServerCacheCleanup.CleanupResult result = ServerCacheCleanup.StartServices();
+                    if (IsHandleCreated && !IsDisposed)
+                    {
+                        BeginInvoke(new Action(delegate
+                        {
+                            Cursor = Cursors.Default;
+                            btnServerCache.Enabled = true;
+                            ShowServerCleanupResult(result, "Запуск служб 1С/BAF");
+                            RefreshServiceStatusLabels();
+                        }));
+                    }
+                });
+            }
+            else
+            {
+                ServerProfile profile = _activeRemote;
+                ServerCacheCleanup.CleanupResult result = null;
+                btnServerCache.Enabled = false;
+                RunRemoteAction(
+                    delegate { result = RemoteClient.ServiceStart(profile); },
+                    delegate
+                    {
+                        btnServerCache.Enabled = true;
+                        ShowServerCleanupResult(result, "Запуск служб 1С/BAF — " + profile.Name);
+                        RefreshServiceStatusLabels();
+                    });
+            }
+        }
+
+        private void MiStopServices_Click(object sender, EventArgs e)
+        {
+            DialogResult confirm = MessageBox.Show(this,
+                "Це зупинить служби 1С/BAF. 1С стане недоступним для ВСІХ користувачів сервера, доки службу не буде запущено знову.\n\n" +
+                "Усім активним сеансам буде надіслано попередження і 30-секундний відлік перед початком. Продовжити?",
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes) return;
+
+            List<int> ids = CollectOtherSessionIds();
+            WarnSessionsFireAndForget(ids, "Через 30 секунд буде зупинено служби 1С/BAF. Будь ласка, збережіть роботу.");
+
+            if (ShowCountdownDialog(30)) return;
+
+            btnServerCache.Enabled = false;
+
+            if (_activeRemote == null)
+            {
+                Cursor = Cursors.WaitCursor;
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    ServerCacheCleanup.CleanupResult result = ServerCacheCleanup.StopServices();
+                    if (IsHandleCreated && !IsDisposed)
+                    {
+                        BeginInvoke(new Action(delegate
+                        {
+                            Cursor = Cursors.Default;
+                            btnServerCache.Enabled = true;
+                            ShowServerCleanupResult(result, "Зупинка служб 1С/BAF");
+                            RefreshServiceStatusLabels();
+                        }));
+                    }
+                });
+            }
+            else
+            {
+                ServerProfile profile = _activeRemote;
+                ServerCacheCleanup.CleanupResult result = null;
+                RunRemoteAction(
+                    delegate { result = RemoteClient.ServiceStop(profile); },
+                    delegate
+                    {
+                        btnServerCache.Enabled = true;
+                        ShowServerCleanupResult(result, "Зупинка служб 1С/BAF — " + profile.Name);
+                        RefreshServiceStatusLabels();
+                    });
+            }
+        }
+
+        private void MiRestartServices_Click(object sender, EventArgs e)
+        {
+            DialogResult confirm = MessageBox.Show(this,
+                "Це перезапустить служби 1С/BAF (без очищення кешу). 1С стане недоступним для ВСІХ користувачів сервера на короткий час.\n\n" +
+                "Усім активним сеансам буде надіслано попередження і 30-секундний відлік перед початком. Продовжити?",
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes) return;
+
+            List<int> ids = CollectOtherSessionIds();
+            WarnSessionsFireAndForget(ids, "Через 30 секунд буде перезапущено служби 1С/BAF. Будь ласка, збережіть роботу.");
+
+            if (ShowCountdownDialog(30)) return;
+
+            btnServerCache.Enabled = false;
+
+            if (_activeRemote == null)
+            {
+                Cursor = Cursors.WaitCursor;
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    ServerCacheCleanup.CleanupResult result = ServerCacheCleanup.RestartServices();
+                    if (IsHandleCreated && !IsDisposed)
+                    {
+                        BeginInvoke(new Action(delegate
+                        {
+                            Cursor = Cursors.Default;
+                            btnServerCache.Enabled = true;
+                            if (ids.Count > 0) SendMessageToSessions(ids, "Можна працювати.");
+                            ShowServerCleanupResult(result, "Перезапуск служб 1С/BAF");
+                            RefreshServiceStatusLabels();
+                        }));
+                    }
+                });
+            }
+            else
+            {
+                ServerProfile profile = _activeRemote;
+                ServerCacheCleanup.CleanupResult result = null;
+                RunRemoteAction(
+                    delegate
+                    {
+                        result = RemoteClient.ServiceRestart(profile);
+                        if (ids.Count > 0)
+                        {
+                            try { RemoteClient.SendMessage(profile, ids, "Можна працювати."); }
+                            catch { /* не критично */ }
+                        }
+                    },
+                    delegate
+                    {
+                        btnServerCache.Enabled = true;
+                        ShowServerCleanupResult(result, "Перезапуск служб 1С/BAF — " + profile.Name);
+                        RefreshServiceStatusLabels();
+                    });
+            }
+        }
+
+        private void BtnServers_Click(object sender, EventArgs e)
+        {
+            if (_serverManagerForm == null || _serverManagerForm.IsDisposed)
+            {
+                _serverManagerForm = new ServerManagerForm(this);
+            }
+
+            if (!_serverManagerForm.Visible) _serverManagerForm.Show(this);
+            _serverManagerForm.BringToFront();
+            _serverManagerForm.Activate();
         }
 
         private bool ShowCountdownDialog(int seconds)
@@ -1780,7 +3406,7 @@ namespace ShadowSessionTool
             }
         }
 
-        private static int RunHidden(string exe, string args)
+        internal static int RunHidden(string exe, string args)
         {
             try
             {
@@ -2138,17 +3764,12 @@ namespace ShadowSessionTool
             string message = ShowInputDialog(prompt, "Надіслати повідомлення", false, true);
             if (string.IsNullOrEmpty(message)) return;
 
-            SendMessageToSessions(ids, message);
+            SendMessageDispatch(ids, message);
         }
 
         private void MiCtxMessageAll_Click(object sender, EventArgs e)
         {
-            List<int> ids = new List<int>();
-            foreach (RdpSession s in _allSessions)
-            {
-                int id;
-                if (int.TryParse(s.Id, out id) && id != _ownSessionId) ids.Add(id);
-            }
+            List<int> ids = CollectOtherSessionIds();
 
             if (ids.Count == 0)
             {
@@ -2161,10 +3782,33 @@ namespace ShadowSessionTool
                 "Надіслати повідомлення всім", false, true);
             if (string.IsNullOrEmpty(message)) return;
 
-            SendMessageToSessions(ids, message);
+            SendMessageDispatch(ids, message);
+        }
+
+        private void SendMessageDispatch(List<int> ids, string message)
+        {
+            if (_activeRemote == null)
+            {
+                SendMessageToSessions(ids, message);
+                return;
+            }
+
+            ServerProfile profile = _activeRemote;
+            RunRemoteAction(delegate { RemoteClient.SendMessage(profile, ids, message); }, null);
         }
 
         private void SendMessageToSessions(List<int> ids, string message)
+        {
+            List<string> failed = SendMessageToSessionsCore(ids, message);
+
+            if (failed.Count > 0)
+            {
+                MessageBox.Show(this, "Не вдалося надіслати повідомлення сеансу(ам) з ID: " + string.Join(", ", failed.ToArray()), "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        /// <summary>Без UI-побічних дій - переюзається сервером віддаленого керування (розділ 5/6).</summary>
+        internal static List<string> SendMessageToSessionsCore(List<int> ids, string message)
         {
             const string title = "Повідомлення від адміністратора";
             int titleBytes = (title.Length + 1) * 2;
@@ -2177,11 +3821,7 @@ namespace ShadowSessionTool
                 bool ok = Wts.WTSSendMessage(IntPtr.Zero, id, title, titleBytes, message, messageBytes, 0, 0, out response, false);
                 if (!ok) failed.Add(id.ToString());
             }
-
-            if (failed.Count > 0)
-            {
-                MessageBox.Show(this, "Не вдалося надіслати повідомлення сеансу(ам) з ID: " + string.Join(", ", failed.ToArray()), "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
+            return failed;
         }
 
         private string ShowInputDialog(string prompt, string title, bool isPassword = false, bool showTemplates = false)
@@ -2457,7 +4097,7 @@ namespace ShadowSessionTool
             lvSessions.BackColor = listBack;
             lvSessions.ForeColor = listFore;
 
-            Button[] buttons = { btnRefresh, btnServerCache, btnEnablePolicy, btnDisconnect, btnDisconnectAll, btnReboot };
+            Button[] buttons = { btnRefresh, btnServerCache, btnServers, btnGoLocal, btnEnablePolicy, btnDisconnect, btnDisconnectAll, btnReboot };
             foreach (Button btn in buttons)
             {
                 btn.FlatStyle = btnStyle;
@@ -2528,12 +4168,144 @@ namespace ShadowSessionTool
             }
         }
 
+        /// <summary>
+        /// Виконує <paramref name="work"/> у фоновому потоці (ThreadPool) - обов'язково для будь-якого мережевого
+        /// виклику RemoteClient, щоб не блокувати UI-потік (той самий патерн, що й FetchExternalIpAsync).
+        /// <paramref name="onSuccess"/> викликається через BeginInvoke після успішного завершення; помилка показується MessageBox.
+        /// </summary>
+        private void RunRemoteAction(Action work, Action onSuccess)
+        {
+            Cursor = Cursors.WaitCursor;
+            Enabled = false;
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                Exception error = null;
+                try
+                {
+                    work();
+                }
+                catch (Exception ex)
+                {
+                    error = ex;
+                }
+
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        Cursor = Cursors.Default;
+                        Enabled = true;
+                        if (error != null)
+                        {
+                            MessageBox.Show(this, "Помилка віддаленої дії: " + error.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
+                        else if (onSuccess != null)
+                        {
+                            onSuccess();
+                        }
+                    }));
+                }
+            });
+        }
+
+        private void UpdateRemoteBanner()
+        {
+            bool remote = _activeRemote != null;
+            lblRemoteBanner.Visible = remote;
+            btnGoLocal.Visible = remote;
+            Text = remote
+                ? string.Format("Засіб тіньових сеансів — {0} ({1})", _activeRemote.Name, _activeRemote.Host)
+                : "Засіб тіньових сеансів";
+            lblRemoteBanner.Text = remote
+                ? string.Format("Підключено до: {0} ({1})", _activeRemote.Name, _activeRemote.Host)
+                : "";
+        }
+
+        /// <summary>Викликається з ServerManagerForm при успішному підключенні до профілю.</summary>
+        internal void ConnectToProfile(ServerProfile profile)
+        {
+            _activeRemote = profile;
+            UpdateRemoteBanner();
+            RefreshSessions();
+            RefreshServiceStatusLabels();
+        }
+
+        /// <summary>Повертає керування до локального сервера. Викликається і кнопкою "Локально", і зі ServerManagerForm.</summary>
+        internal void DisconnectRemote()
+        {
+            _activeRemote = null;
+            UpdateRemoteBanner();
+            RefreshSessions();
+            RefreshServiceStatusLabels();
+        }
+
+        private void BtnGoLocal_Click(object sender, EventArgs e)
+        {
+            DisconnectRemote();
+        }
+
+        internal ServerProfile ActiveRemote { get { return _activeRemote; } }
+        internal RemoteControlServer RemoteServer { get { return _remoteServer; } }
+
+        // Кольори/стилі для дочірніх форм (ServerManagerForm тощо) - узгоджено з поточною темою, за зразком існуючих діалогів.
+        internal Color DialogTextColor { get { return lblSelect.ForeColor; } }
+        internal Color DialogHintColor { get { return lblHint.ForeColor; } }
+        internal Color DialogInputBack { get { return txtSearch.BackColor; } }
+        internal Color DialogInputFore { get { return txtSearch.ForeColor; } }
+        internal FlatStyle DialogButtonFlatStyle { get { return btnDisconnect.FlatStyle; } }
+        internal Color DialogButtonBack { get { return btnDisconnect.BackColor; } }
+        internal Color DialogButtonFore { get { return btnDisconnect.ForeColor; } }
+        internal Color DialogButtonBorder { get { return btnDisconnect.FlatAppearance.BorderColor; } }
+
         private void RefreshSessions()
         {
+            if (_activeRemote != null)
+            {
+                RefreshSessionsRemote();
+                return;
+            }
+
             _allSessions = GetRdpSessions();
             ApplyCachedAccountInfo(_allSessions);
             ApplyFilter();
             FetchAccountInfoAsync(_allSessions);
+        }
+
+        private void RefreshSessionsRemote()
+        {
+            ServerProfile profile = _activeRemote;
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                List<RdpSession> sessions = null;
+                string error = null;
+                try
+                {
+                    sessions = RemoteClient.ListSessions(profile);
+                }
+                catch (Exception ex)
+                {
+                    error = ex.Message;
+                }
+
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        if (_activeRemote != profile) return; // користувач встиг відключитись/перемкнутись
+                        if (error != null)
+                        {
+                            _allSessions = new List<RdpSession>();
+                            ApplyFilter();
+                            lblRemoteBanner.Text = string.Format("Підключено до: {0} ({1}) — помилка: {2}", profile.Name, profile.Host, error);
+                        }
+                        else
+                        {
+                            _allSessions = sessions;
+                            ApplyFilter();
+                        }
+                    }));
+                }
+            });
         }
 
         private static string GetAccountCacheKey(RdpSession s)
@@ -2614,7 +4386,7 @@ namespace ShadowSessionTool
 
                 bool isOwn = false;
                 int id;
-                if (int.TryParse(s.Id, out id) && id == _ownSessionId) isOwn = true;
+                if (_activeRemote == null && int.TryParse(s.Id, out id) && id == _ownSessionId) isOwn = true;
 
                 ListViewItem item = new ListViewItem(s.UserName);
                 item.SubItems.Add(s.FullName);
@@ -2652,7 +4424,7 @@ namespace ShadowSessionTool
             }
         }
 
-        private List<RdpSession> GetRdpSessions()
+        internal static List<RdpSession> GetRdpSessions()
         {
             List<RdpSession> result = new List<RdpSession>();
             IntPtr pSessionInfo = IntPtr.Zero;
@@ -2710,7 +4482,7 @@ namespace ShadowSessionTool
             return result;
         }
 
-        private string GetSessionUserName(int sessionId)
+        internal static string GetSessionUserName(int sessionId)
         {
             IntPtr buffer;
             int bytesReturned;
@@ -2728,7 +4500,7 @@ namespace ShadowSessionTool
             return result;
         }
 
-        private string GetSessionDomainName(int sessionId)
+        internal static string GetSessionDomainName(int sessionId)
         {
             IntPtr buffer;
             int bytesReturned;
@@ -2746,7 +4518,7 @@ namespace ShadowSessionTool
             return result;
         }
 
-        private static UserAccountInfo GetUserAccountInfo(string userName, string domainName)
+        internal static UserAccountInfo GetUserAccountInfo(string userName, string domainName)
         {
             UserAccountInfo info = new UserAccountInfo();
 
@@ -2962,6 +4734,138 @@ namespace ShadowSessionTool
             }
         }
 
+        /// <summary>Розділ 2: статус служб 1С/BAF праворуч від зовнішнього IP - локально або (якщо є активний профіль) віддалено.</summary>
+        private void RefreshServiceStatusLabels()
+        {
+            if (_activeRemote != null)
+            {
+                RefreshServiceStatusLabelsRemote();
+                return;
+            }
+
+            RenderServiceStatusLabels("Служби 1С:", ServerCacheCleanup.GetServiceStatuses());
+        }
+
+        private void RefreshServiceStatusLabelsRemote()
+        {
+            ServerProfile profile = _activeRemote;
+            RenderServiceStatusLabels("Служби 1С (" + profile.Name + "):", null, "перевірка...");
+
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                Dictionary<string, string> statuses = null;
+                string error = null;
+                try
+                {
+                    statuses = RemoteClient.ServiceStatus(profile);
+                }
+                catch (Exception ex)
+                {
+                    error = ex.Message;
+                }
+
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        if (_activeRemote != profile) return;
+                        RenderServiceStatusLabels("Служби 1С (" + profile.Name + "):", statuses, error == null ? null : "недоступно");
+                    }));
+                }
+            });
+        }
+
+        private void RenderServiceStatusLabels(string caption, Dictionary<string, string> statuses)
+        {
+            RenderServiceStatusLabels(caption, statuses, statuses == null ? "недоступно" : null);
+        }
+
+        private void RenderServiceStatusLabels(string caption, Dictionary<string, string> statuses, string placeholder)
+        {
+            foreach (Label old in _serviceStatusLabels) Controls.Remove(old);
+            _serviceStatusLabels.Clear();
+
+            Font svcFont = new Font("Segoe UI", 8F);
+            const int x = 290;
+            int y = 152;
+
+            Label captionLbl = new Label
+            {
+                AutoSize = true,
+                Font = svcFont,
+                Location = new Point(x, y),
+                Text = caption,
+                ForeColor = lblHint.ForeColor
+            };
+            Controls.Add(captionLbl);
+            _serviceStatusLabels.Add(captionLbl);
+            y += captionLbl.PreferredHeight;
+
+            if (statuses == null)
+            {
+                Label ph = new Label
+                {
+                    AutoSize = true,
+                    Font = svcFont,
+                    Location = new Point(x, y),
+                    Text = placeholder ?? "недоступно",
+                    ForeColor = Color.Firebrick
+                };
+                Controls.Add(ph);
+                _serviceStatusLabels.Add(ph);
+                return;
+            }
+
+            foreach (string svcName in ServerCacheCleanup.ServiceNames)
+            {
+                string status;
+                statuses.TryGetValue(svcName, out status);
+
+                string text;
+                Color color;
+                if (status == null)
+                {
+                    text = svcName + " — не встановлено";
+                    color = Color.Gray;
+                }
+                else if (string.Equals(status, "Running", StringComparison.OrdinalIgnoreCase))
+                {
+                    text = svcName + " — запущено";
+                    color = Color.ForestGreen;
+                }
+                else
+                {
+                    text = svcName + " — " + TranslateServiceStatus(status);
+                    color = Color.Firebrick;
+                }
+
+                Label lbl = new Label
+                {
+                    AutoSize = true,
+                    MaximumSize = new Size(390, 0),
+                    Font = svcFont,
+                    Location = new Point(x, y),
+                    Text = text,
+                    ForeColor = color
+                };
+                Controls.Add(lbl);
+                _serviceStatusLabels.Add(lbl);
+                y += lbl.PreferredHeight;
+            }
+        }
+
+        private static string TranslateServiceStatus(string status)
+        {
+            switch (status)
+            {
+                case "Stopped": return "зупинено";
+                case "StartPending": return "запускається";
+                case "StopPending": return "зупиняється";
+                case "Paused": return "призупинено";
+                default: return status;
+            }
+        }
+
         private void FetchExternalIpAsync()
         {
             System.Threading.ThreadPool.QueueUserWorkItem(delegate
@@ -3032,6 +4936,585 @@ namespace ShadowSessionTool
             {
                 MessageBox.Show(this, "Не вдалося оновити застосунок: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+    }
+
+    /// <summary>
+    /// Розділ 3: немодальне вікно "Сервери..." - список профілів (з пінгом) і секція "Дозволити керування цим сервером".
+    /// </summary>
+    internal class ServerManagerForm : Form
+    {
+        private const string FirewallRuleName = "ShadowSessionTool Remote";
+
+        private readonly MainForm _owner;
+        private List<ServerProfile> _profiles = new List<ServerProfile>();
+        private readonly Dictionary<Guid, ListViewItem> _itemsByProfile = new Dictionary<Guid, ListViewItem>();
+        private Timer _pingTimer;
+
+        private ListView lvProfiles;
+        private Button btnAdd, btnEdit, btnDelete, btnConnect, btnPingRefresh;
+
+        private CheckBox chkRcEnabled;
+        private TextBox txtRcUser;
+        private TextBox txtRcPassword;
+        private NumericUpDown numRcPort;
+        private Label lblRcStatus;
+        private Label lblRcActivity;
+        private Button btnApplyRc;
+
+        internal ServerManagerForm(MainForm owner)
+        {
+            _owner = owner;
+            InitializeComponent();
+
+            LoadProfilesIntoList();
+            LoadRemoteControlSection();
+
+            _owner.RemoteServer.Activity += RemoteServer_Activity;
+
+            _pingTimer = new Timer { Interval = 5000 };
+            _pingTimer.Tick += (s, e) => PingAllAsync();
+            _pingTimer.Start();
+
+            Shown += (s, e) => PingAllAsync();
+            FormClosed += (s, e) =>
+            {
+                _owner.RemoteServer.Activity -= RemoteServer_Activity;
+                if (_pingTimer != null) { _pingTimer.Stop(); _pingTimer.Dispose(); _pingTimer = null; }
+            };
+        }
+
+        private void RemoteServer_Activity(object sender, RemoteActivityEventArgs e)
+        {
+            if (lblRcActivity != null) lblRcActivity.Text = "Остання активність: " + e.Text;
+        }
+
+        private void InitializeComponent()
+        {
+            Text = "Сервери";
+            Font = _owner.Font;
+            BackColor = _owner.BackColor;
+            ClientSize = new Size(560, 470);
+            MinimumSize = new Size(500, 420);
+            StartPosition = FormStartPosition.CenterParent;
+            ShowInTaskbar = false;
+
+            lvProfiles = new ListView
+            {
+                View = View.Details,
+                FullRowSelect = true,
+                GridLines = true,
+                MultiSelect = false,
+                Location = new Point(12, 12),
+                Size = new Size(536, 170),
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+                BackColor = _owner.DialogInputBack,
+                ForeColor = _owner.DialogInputFore
+            };
+            lvProfiles.Columns.Add("Назва", 130);
+            lvProfiles.Columns.Add("Хост", 130);
+            lvProfiles.Columns.Add("Порт", 60);
+            lvProfiles.Columns.Add("Користувач", 110);
+            lvProfiles.Columns.Add("Пінг", 80);
+            lvProfiles.SelectedIndexChanged += (s, e) => UpdateButtons();
+            lvProfiles.DoubleClick += BtnConnect_Click;
+
+            btnAdd = MakeButton("Додати", new Point(12, 190));
+            btnAdd.Click += BtnAdd_Click;
+            btnEdit = MakeButton("Редагувати", new Point(112, 190));
+            btnEdit.Click += BtnEdit_Click;
+            btnDelete = MakeButton("Видалити", new Point(212, 190));
+            btnDelete.Click += BtnDelete_Click;
+            btnPingRefresh = MakeButton("Оновити пінг", new Point(312, 190));
+            btnPingRefresh.Click += (s, e) => PingAllAsync();
+            btnConnect = MakeButton("Підключитися", new Point(412, 190));
+            btnConnect.Size = new Size(136, 26);
+            btnConnect.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            btnConnect.Click += BtnConnect_Click;
+
+            GroupBox grp = new GroupBox
+            {
+                Text = "Дозволити керування цим сервером",
+                Location = new Point(12, 228),
+                Size = new Size(536, 210),
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom,
+                ForeColor = _owner.DialogTextColor
+            };
+
+            chkRcEnabled = new CheckBox
+            {
+                Text = "Увімкнено",
+                Location = new Point(12, 24),
+                AutoSize = true,
+                ForeColor = _owner.DialogTextColor
+            };
+
+            Label lblUser = MakeLabel("Користувач:", 12, 55);
+            txtRcUser = MakeTextBox(120, 52, 180, "");
+
+            Label lblPassword = MakeLabel("Пароль:", 12, 85);
+            txtRcPassword = MakeTextBox(120, 82, 180, "");
+            txtRcPassword.UseSystemPasswordChar = true;
+
+            Label lblPort = MakeLabel("Порт:", 12, 115);
+            numRcPort = new NumericUpDown
+            {
+                Minimum = 1,
+                Maximum = 65535,
+                Value = RemoteProtocol.DefaultPort,
+                Location = new Point(120, 112),
+                Size = new Size(90, 23)
+            };
+
+            btnApplyRc = MakeButton("Застосувати", new Point(320, 80));
+            btnApplyRc.Size = new Size(120, 28);
+            btnApplyRc.Click += BtnApplyRc_Click;
+
+            lblRcStatus = new Label
+            {
+                AutoSize = true,
+                Location = new Point(12, 148),
+                Text = "Вимкнено",
+                ForeColor = Color.Gray
+            };
+
+            lblRcActivity = new Label
+            {
+                AutoSize = true,
+                MaximumSize = new Size(500, 0),
+                Location = new Point(12, 168),
+                Text = "Остання активність: —",
+                ForeColor = _owner.DialogHintColor
+            };
+
+            Label lblSecurityHint = new Label
+            {
+                AutoSize = true,
+                MaximumSize = new Size(500, 0),
+                Location = new Point(12, 190),
+                ForeColor = _owner.DialogHintColor,
+                Text = "Пароль і корисне навантаження команд передаються між серверами зашифрованими (AES-256), " +
+                    "але саме TCP-з'єднання без TLS — використовуйте лише в довіреній внутрішній мережі."
+            };
+
+            grp.Controls.Add(chkRcEnabled);
+            grp.Controls.Add(lblUser);
+            grp.Controls.Add(txtRcUser);
+            grp.Controls.Add(lblPassword);
+            grp.Controls.Add(txtRcPassword);
+            grp.Controls.Add(lblPort);
+            grp.Controls.Add(numRcPort);
+            grp.Controls.Add(btnApplyRc);
+            grp.Controls.Add(lblRcStatus);
+            grp.Controls.Add(lblRcActivity);
+            grp.Controls.Add(lblSecurityHint);
+
+            Controls.Add(lvProfiles);
+            Controls.Add(btnAdd);
+            Controls.Add(btnEdit);
+            Controls.Add(btnDelete);
+            Controls.Add(btnPingRefresh);
+            Controls.Add(btnConnect);
+            Controls.Add(grp);
+        }
+
+        private Label MakeLabel(string text, int x, int y)
+        {
+            return new Label { Text = text, AutoSize = true, Location = new Point(x, y), ForeColor = _owner.DialogTextColor };
+        }
+
+        private TextBox MakeTextBox(int x, int y, int width, string value)
+        {
+            return new TextBox
+            {
+                Text = value ?? "",
+                Location = new Point(x, y),
+                Size = new Size(width, 23),
+                BackColor = _owner.DialogInputBack,
+                ForeColor = _owner.DialogInputFore
+            };
+        }
+
+        private Button MakeButton(string text, Point location)
+        {
+            Button b = new Button
+            {
+                Text = text,
+                Location = location,
+                Size = new Size(94, 26),
+                FlatStyle = _owner.DialogButtonFlatStyle,
+                BackColor = _owner.DialogButtonBack,
+                ForeColor = _owner.DialogButtonFore
+            };
+            b.FlatAppearance.BorderColor = _owner.DialogButtonBorder;
+            return b;
+        }
+
+        // --- Профілі ---
+
+        private void LoadProfilesIntoList()
+        {
+            _profiles = ServerProfileStore.LoadProfiles();
+            RebuildListView();
+        }
+
+        private void RebuildListView()
+        {
+            lvProfiles.Items.Clear();
+            _itemsByProfile.Clear();
+
+            foreach (ServerProfile p in _profiles)
+            {
+                ListViewItem item = new ListViewItem(p.Name);
+                item.SubItems.Add(p.Host);
+                item.SubItems.Add(p.Port.ToString());
+                item.SubItems.Add(p.User);
+                item.SubItems.Add(FormatPing(p.LastPingMs));
+                item.Tag = p;
+
+                if (_owner.ActiveRemote != null && _owner.ActiveRemote.Id == p.Id)
+                {
+                    item.BackColor = Color.LightGreen;
+                    item.ForeColor = Color.Black;
+                }
+
+                lvProfiles.Items.Add(item);
+                _itemsByProfile[p.Id] = item;
+            }
+
+            UpdateButtons();
+        }
+
+        private static string FormatPing(double ms)
+        {
+            if (ms <= -1.5) return "недоступний";
+            if (ms < 0) return "...";
+            return ms.ToString("0") + " мс";
+        }
+
+        private void UpdateButtons()
+        {
+            bool hasSel = lvProfiles.SelectedItems.Count == 1;
+            btnEdit.Enabled = hasSel;
+            btnDelete.Enabled = hasSel;
+            btnConnect.Enabled = hasSel;
+
+            if (hasSel)
+            {
+                ServerProfile p = (ServerProfile)lvProfiles.SelectedItems[0].Tag;
+                bool connected = _owner.ActiveRemote != null && _owner.ActiveRemote.Id == p.Id;
+                btnConnect.Text = connected ? "Відключитися" : "Підключитися";
+            }
+            else
+            {
+                btnConnect.Text = "Підключитися";
+            }
+        }
+
+        private void BtnAdd_Click(object sender, EventArgs e)
+        {
+            ServerProfile p = new ServerProfile();
+            p.Port = RemoteProtocol.DefaultPort;
+            if (!ShowProfileDialog(p, true)) return;
+
+            ServerProfileStore.SaveProfile(p);
+            _profiles.Add(p);
+            RebuildListView();
+            PingAllAsync();
+        }
+
+        private void BtnEdit_Click(object sender, EventArgs e)
+        {
+            if (lvProfiles.SelectedItems.Count != 1) return;
+            ServerProfile p = (ServerProfile)lvProfiles.SelectedItems[0].Tag;
+            if (!ShowProfileDialog(p, false)) return;
+
+            ServerProfileStore.SaveProfile(p);
+            RebuildListView();
+
+            if (_owner.ActiveRemote != null && _owner.ActiveRemote.Id == p.Id)
+            {
+                _owner.ConnectToProfile(p); // оновити банер, якщо ім'я/host відредаговано під час активного підключення
+            }
+        }
+
+        private void BtnDelete_Click(object sender, EventArgs e)
+        {
+            if (lvProfiles.SelectedItems.Count != 1) return;
+            ServerProfile p = (ServerProfile)lvProfiles.SelectedItems[0].Tag;
+
+            DialogResult confirm = MessageBox.Show(this,
+                string.Format("Видалити профіль \"{0}\"?", p.Name),
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes) return;
+
+            if (_owner.ActiveRemote != null && _owner.ActiveRemote.Id == p.Id)
+            {
+                _owner.DisconnectRemote();
+            }
+
+            ServerProfileStore.DeleteProfile(p.Id);
+            _profiles.Remove(p);
+            RebuildListView();
+        }
+
+        private void BtnConnect_Click(object sender, EventArgs e)
+        {
+            if (lvProfiles.SelectedItems.Count != 1) return;
+            ServerProfile p = (ServerProfile)lvProfiles.SelectedItems[0].Tag;
+
+            bool alreadyConnected = _owner.ActiveRemote != null && _owner.ActiveRemote.Id == p.Id;
+            if (alreadyConnected)
+            {
+                _owner.DisconnectRemote();
+                RebuildListView();
+                return;
+            }
+
+            btnConnect.Enabled = false;
+            Cursor = Cursors.WaitCursor;
+
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                Exception error = null;
+                try
+                {
+                    RemoteClient.ListSessions(p); // "AUTH" - перевірка пароля/доступності перед перемиканням UI
+                }
+                catch (Exception ex)
+                {
+                    error = ex;
+                }
+
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        Cursor = Cursors.Default;
+                        btnConnect.Enabled = true;
+
+                        if (error != null)
+                        {
+                            MessageBox.Show(this, "Не вдалося підключитися до \"" + p.Name + "\": " + error.Message,
+                                "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            return;
+                        }
+
+                        _owner.ConnectToProfile(p);
+                        RebuildListView();
+                    }));
+                }
+            });
+        }
+
+        private bool ShowProfileDialog(ServerProfile p, bool isNew)
+        {
+            using (Form dlg = new Form())
+            {
+                dlg.Text = isNew ? "Новий профіль сервера" : "Редагувати профіль сервера";
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.MinimizeBox = false;
+                dlg.MaximizeBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.ClientSize = new Size(320, 230);
+                dlg.Font = Font;
+                dlg.BackColor = _owner.BackColor;
+
+                Label lblName = MakeLabel("Назва:", 12, 15);
+                TextBox txtName = MakeTextBox(110, 12, 198, p.Name);
+
+                Label lblHost = MakeLabel("IP/host:", 12, 45);
+                TextBox txtHost = MakeTextBox(110, 42, 198, p.Host);
+
+                Label lblPort = MakeLabel("Порт:", 12, 75);
+                NumericUpDown numPort = new NumericUpDown
+                {
+                    Minimum = 1,
+                    Maximum = 65535,
+                    Value = p.Port > 0 ? p.Port : RemoteProtocol.DefaultPort,
+                    Location = new Point(110, 72),
+                    Size = new Size(100, 23)
+                };
+
+                Label lblUser = MakeLabel("Користувач:", 12, 105);
+                TextBox txtUser = MakeTextBox(110, 102, 198, p.User);
+
+                Label lblPassword = MakeLabel("Пароль:", 12, 135);
+                TextBox txtPassword = MakeTextBox(110, 132, 198, p.Password);
+                txtPassword.UseSystemPasswordChar = true;
+
+                Button ok = new Button
+                {
+                    Text = "Зберегти",
+                    DialogResult = DialogResult.OK,
+                    Location = new Point(140, 188),
+                    Size = new Size(80, 28),
+                    FlatStyle = _owner.DialogButtonFlatStyle,
+                    BackColor = _owner.DialogButtonBack,
+                    ForeColor = _owner.DialogButtonFore
+                };
+                ok.FlatAppearance.BorderColor = _owner.DialogButtonBorder;
+
+                Button cancel = new Button
+                {
+                    Text = "Скасувати",
+                    DialogResult = DialogResult.Cancel,
+                    Location = new Point(228, 188),
+                    Size = new Size(80, 28),
+                    FlatStyle = _owner.DialogButtonFlatStyle,
+                    BackColor = _owner.DialogButtonBack,
+                    ForeColor = _owner.DialogButtonFore
+                };
+                cancel.FlatAppearance.BorderColor = _owner.DialogButtonBorder;
+
+                dlg.Controls.Add(lblName);
+                dlg.Controls.Add(txtName);
+                dlg.Controls.Add(lblHost);
+                dlg.Controls.Add(txtHost);
+                dlg.Controls.Add(lblPort);
+                dlg.Controls.Add(numPort);
+                dlg.Controls.Add(lblUser);
+                dlg.Controls.Add(txtUser);
+                dlg.Controls.Add(lblPassword);
+                dlg.Controls.Add(txtPassword);
+                dlg.Controls.Add(ok);
+                dlg.Controls.Add(cancel);
+                dlg.AcceptButton = ok;
+                dlg.CancelButton = cancel;
+
+                if (dlg.ShowDialog(this) != DialogResult.OK) return false;
+
+                if (string.IsNullOrEmpty(txtName.Text.Trim()) || string.IsNullOrEmpty(txtHost.Text.Trim()))
+                {
+                    MessageBox.Show(this, "Вкажіть назву й адресу сервера.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return false;
+                }
+
+                p.Name = txtName.Text.Trim();
+                p.Host = txtHost.Text.Trim();
+                p.Port = (int)numPort.Value;
+                p.User = txtUser.Text.Trim();
+                p.Password = txtPassword.Text;
+                return true;
+            }
+        }
+
+        private void PingAllAsync()
+        {
+            List<ServerProfile> snapshot = new List<ServerProfile>(_profiles);
+            foreach (ServerProfile p in snapshot)
+            {
+                ServerProfile captured = p;
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    double ms = PingHost(captured.Host);
+
+                    if (IsHandleCreated && !IsDisposed)
+                    {
+                        BeginInvoke(new Action(delegate
+                        {
+                            captured.LastPingMs = ms;
+                            ListViewItem item;
+                            if (_itemsByProfile.TryGetValue(captured.Id, out item))
+                            {
+                                item.SubItems[4].Text = FormatPing(ms);
+                            }
+                        }));
+                    }
+                });
+            }
+        }
+
+        private static double PingHost(string host)
+        {
+            if (string.IsNullOrEmpty(host)) return -2;
+            try
+            {
+                using (Ping ping = new Ping())
+                {
+                    PingReply reply = ping.Send(host, 2000);
+                    if (reply != null && reply.Status == IPStatus.Success) return reply.RoundtripTime;
+                    return -2;
+                }
+            }
+            catch
+            {
+                return -2;
+            }
+        }
+
+        // --- "Дозволити керування цим сервером" ---
+
+        private void LoadRemoteControlSection()
+        {
+            ServerProfileStore.RemoteControlSettings settings = ServerProfileStore.LoadRemoteControlSettings();
+            chkRcEnabled.Checked = settings.Enabled;
+            txtRcUser.Text = settings.User;
+            txtRcPassword.Text = settings.Password;
+            numRcPort.Value = settings.Port > 0 ? settings.Port : RemoteProtocol.DefaultPort;
+
+            UpdateRcStatusLabel();
+        }
+
+        private void UpdateRcStatusLabel()
+        {
+            if (_owner.RemoteServer.IsRunning)
+            {
+                lblRcStatus.Text = "Слухає на порту " + _owner.RemoteServer.Port;
+                lblRcStatus.ForeColor = Color.ForestGreen;
+            }
+            else
+            {
+                lblRcStatus.Text = "Вимкнено";
+                lblRcStatus.ForeColor = Color.Gray;
+            }
+        }
+
+        private void BtnApplyRc_Click(object sender, EventArgs e)
+        {
+            bool enable = chkRcEnabled.Checked;
+            int port = (int)numRcPort.Value;
+            string user = txtRcUser.Text.Trim();
+            string password = txtRcPassword.Text;
+
+            if (enable && (string.IsNullOrEmpty(user) || string.IsNullOrEmpty(password)))
+            {
+                MessageBox.Show(this, "Вкажіть користувача й пароль для дозволу керування.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            RemoteControlServer server = _owner.RemoteServer;
+
+            if (server.IsRunning)
+            {
+                server.Stop();
+                MainForm.RunHidden("netsh.exe", "advfirewall firewall delete rule name=\"" + FirewallRuleName + "\"");
+            }
+
+            ServerProfileStore.RemoteControlSettings settings = new ServerProfileStore.RemoteControlSettings();
+            settings.Enabled = enable;
+            settings.Port = port;
+            settings.User = user;
+            settings.Password = password;
+            ServerProfileStore.SaveRemoteControlSettings(settings);
+
+            if (enable)
+            {
+                string error = server.Start(port, user, password);
+                if (error != null)
+                {
+                    lblRcStatus.Text = "Помилка: " + error;
+                    lblRcStatus.ForeColor = Color.Firebrick;
+                    return;
+                }
+
+                MainForm.RunHidden("netsh.exe", string.Format(
+                    "advfirewall firewall add rule name=\"{0}\" dir=in action=allow protocol=TCP localport={1}",
+                    FirewallRuleName, port));
+            }
+
+            UpdateRcStatusLabel();
         }
     }
 }
