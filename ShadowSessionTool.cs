@@ -818,6 +818,9 @@ namespace ShadowSessionTool
             ToolStripMenuItem miCancelScheduleServerCleanup = new ToolStripMenuItem("Скасувати заплановане");
             miCancelScheduleServerCleanup.Click += MiCancelScheduledCleanup_Click;
 
+            ToolStripMenuItem miOpenAdminConsole = new ToolStripMenuItem("Адміністрування серверів 1С...");
+            miOpenAdminConsole.Click += MiOpenAdminConsole_Click;
+
             serverCacheMenu = new ContextMenuStrip();
             serverCacheMenu.Items.Add(miStartServices);
             serverCacheMenu.Items.Add(miStopServices);
@@ -827,6 +830,8 @@ namespace ShadowSessionTool
             serverCacheMenu.Items.Add(new ToolStripSeparator());
             serverCacheMenu.Items.Add(miScheduleServerCleanup);
             serverCacheMenu.Items.Add(miCancelScheduleServerCleanup);
+            serverCacheMenu.Items.Add(new ToolStripSeparator());
+            serverCacheMenu.Items.Add(miOpenAdminConsole);
 
             btnServerCache.Click += (s, e) => serverCacheMenu.Show(btnServerCache, new Point(0, btnServerCache.Height));
 
@@ -1777,6 +1782,31 @@ namespace ShadowSessionTool
                     }));
                 }
             });
+        }
+
+        private void MiOpenAdminConsole_Click(object sender, EventArgs e)
+        {
+            OpenAdminConsole();
+        }
+
+        private void OpenAdminConsole()
+        {
+            const string path = @"C:\Program Files\1cv8\common\1CV8 Servers (x86-64).msc";
+
+            if (!File.Exists(path))
+            {
+                MessageBox.Show(this, "Файл консолі не знайдено:\n" + path, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            try
+            {
+                Process.Start(path);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Не вдалося запустити консоль адміністрування: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         private void MiStartServices_Click(object sender, EventArgs e)
@@ -3266,10 +3296,12 @@ namespace ShadowSessionTool
                     AutoSize = true,
                     MaximumSize = new Size(370, 0),
                     Font = font,
+                    Cursor = Cursors.Hand,
                     Location = new Point(x, y),
                     Text = text,
                     ForeColor = color
                 };
+                lbl.Click += (s, e) => OpenAdminConsole();
                 Controls.Add(lbl);
                 _serviceStatusLabels.Add(lbl);
                 y += lbl.PreferredHeight;
