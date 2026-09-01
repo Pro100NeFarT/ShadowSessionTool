@@ -89,6 +89,12 @@ namespace ShadowSessionTool
         }
     }
 
+    internal static class Kernel32
+    {
+        [DllImport("kernel32.dll")]
+        internal static extern ulong GetTickCount64();
+    }
+
     internal class RdpSession
     {
         public string UserName;
@@ -169,6 +175,12 @@ namespace ShadowSessionTool
         {
             string path;
             return ServiceAdminConsolePaths.TryGetValue(serviceName, out path) ? path : null;
+        }
+
+        internal static string GetSrvInfoPath(string serviceName)
+        {
+            string path;
+            return ServiceSrvInfoPaths.TryGetValue(serviceName, out path) ? path : null;
         }
 
         private static readonly Regex GuidRegex = new Regex(
@@ -662,7 +674,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.7.4";
+        private const string AppVersion = "1.7.5";
 
         private static readonly string[] MessageTemplates =
         {
@@ -698,6 +710,7 @@ namespace ShadowSessionTool
         private Label lblExternalIp;
         private readonly List<Label> _localIpLabels = new List<Label>();
         private readonly List<Label> _serviceStatusLabels = new List<Label>();
+        private readonly List<Label> _extraInfoLabels = new List<Label>();
 
         private ContextMenuStrip ctxMenu;
         private ToolStripMenuItem miCtxConnect;
@@ -749,8 +762,8 @@ namespace ShadowSessionTool
         {
             Text = "Засіб тіньових сеансів";
             Font = new Font("Segoe UI", 9F);
-            ClientSize = new Size(700, 674);
-            MinimumSize = new Size(660, 594);
+            ClientSize = new Size(960, 674);
+            MinimumSize = new Size(920, 594);
             StartPosition = FormStartPosition.CenterScreen;
 
             try
@@ -778,17 +791,17 @@ namespace ShadowSessionTool
 
             themeToolTip = new ToolTip();
 
-            btnThemeLight = new Button { Text = "", Size = new Size(20, 20), Location = new Point(608, 9), BackColor = Color.White, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            btnThemeLight = new Button { Text = "", Size = new Size(20, 20), Location = new Point(868, 9), BackColor = Color.White, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right };
             btnThemeLight.FlatAppearance.BorderColor = Color.Gray;
             btnThemeLight.Click += (s, e) => ApplyTheme(AppTheme.Light);
             themeToolTip.SetToolTip(btnThemeLight, "Світла тема");
 
-            btnThemeDark = new Button { Text = "", Size = new Size(20, 20), Location = new Point(638, 9), BackColor = Color.FromArgb(32, 32, 32), FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            btnThemeDark = new Button { Text = "", Size = new Size(20, 20), Location = new Point(898, 9), BackColor = Color.FromArgb(32, 32, 32), FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right };
             btnThemeDark.FlatAppearance.BorderColor = Color.Gray;
             btnThemeDark.Click += (s, e) => ApplyTheme(AppTheme.Dark);
             themeToolTip.SetToolTip(btnThemeDark, "Темна тема");
 
-            btnThemeBlue = new Button { Text = "", Size = new Size(20, 20), Location = new Point(668, 9), BackColor = Color.FromArgb(70, 130, 220), FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            btnThemeBlue = new Button { Text = "", Size = new Size(20, 20), Location = new Point(928, 9), BackColor = Color.FromArgb(70, 130, 220), FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right };
             btnThemeBlue.FlatAppearance.BorderColor = Color.Gray;
             btnThemeBlue.Click += (s, e) => ApplyTheme(AppTheme.Blue);
             themeToolTip.SetToolTip(btnThemeBlue, "Синя тема");
@@ -802,9 +815,9 @@ namespace ShadowSessionTool
                 Location = new Point(12, 35)
             };
 
-            const int btnW = 165, btnH = 28, colB = 348, colRight = 523;
+            const int btnW = 165, btnH = 28, colB = 608, colRight = 783;
 
-            btnRefresh = new Button { Text = "", Size = new Size(40, 28), Location = new Point(298, 40), Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            btnRefresh = new Button { Text = "", Size = new Size(40, 28), Location = new Point(558, 40), Anchor = AnchorStyles.Top | AnchorStyles.Right };
             btnRefresh.Click += (s, e) => { RefreshSessions(); RefreshPolicyStatus(); RefreshServiceStatusLabels(); };
             themeToolTip.SetToolTip(btnRefresh, "Оновити (F5)");
 
@@ -903,7 +916,7 @@ namespace ShadowSessionTool
             {
                 Text = "Завершити відключені",
                 Size = new Size(btnW, btnH),
-                Location = new Point(447, 225)
+                Location = new Point(colRight, 225)
             };
             btnDisconnectAll.Click += BtnDisconnectAll_Click;
 
@@ -942,7 +955,7 @@ namespace ShadowSessionTool
             txtSearch = new TextBox
             {
                 Location = new Point(12, 228),
-                Size = new Size(170, 23)
+                Size = new Size(400, 23)
             };
             txtSearch.TextChanged += (s, e) => ApplyFilter();
 
@@ -986,7 +999,7 @@ namespace ShadowSessionTool
                 GridLines = true,
                 MultiSelect = true,
                 Location = new Point(12, 258),
-                Size = new Size(676, ClientSize.Height - 258 - 12),
+                Size = new Size(936, ClientSize.Height - 258 - 12),
                 Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
                 ContextMenuStrip = ctxMenu
             };
@@ -1013,7 +1026,8 @@ namespace ShadowSessionTool
             Controls.Add(lblStatus);
             Controls.Add(btnEnablePolicy);
             Controls.Add(lblHint);
-            Controls.Add(btnDisconnect);
+            // btnDisconnect навмисно не додається на форму - "Завершити сеанс" лишився лише в контекстному
+            // меню (miCtxDisconnect); сам об'єкт зберігаємо як шаблон стилю (FlatStyle/кольори) для діалогів.
             Controls.Add(btnDisconnectAll);
             Controls.Add(lblExternalIpCaption);
             Controls.Add(lblExternalIp);
@@ -3316,6 +3330,144 @@ namespace ShadowSessionTool
                 _serviceStatusLabels.Add(lbl);
                 y += lbl.PreferredHeight;
             }
+
+            RefreshExtraInfoLabels();
+        }
+
+        private void RefreshExtraInfoLabels()
+        {
+            foreach (Label old in _extraInfoLabels) Controls.Remove(old);
+            _extraInfoLabels.Clear();
+
+            Font font = new Font("Segoe UI", 8F);
+            const int x = 690;
+            int y = 152;
+
+            Label caption = new Label
+            {
+                AutoSize = true,
+                Font = font,
+                Location = new Point(x, y),
+                Text = "Сервер:",
+                ForeColor = lblHint.ForeColor
+            };
+            Controls.Add(caption);
+            _extraInfoLabels.Add(caption);
+            y += caption.PreferredHeight;
+
+            Label uptimeLbl = new Label
+            {
+                AutoSize = true,
+                Font = font,
+                Location = new Point(x, y),
+                Text = "Час роботи: " + GetUptimeText(),
+                ForeColor = lblHint.ForeColor
+            };
+            Controls.Add(uptimeLbl);
+            _extraInfoLabels.Add(uptimeLbl);
+            y += uptimeLbl.PreferredHeight;
+
+            Label diskLbl = new Label
+            {
+                AutoSize = true,
+                Font = font,
+                Location = new Point(x, y),
+                Text = "Диск C: " + GetDiskUsageText(),
+                ForeColor = lblHint.ForeColor
+            };
+            Controls.Add(diskLbl);
+            _extraInfoLabels.Add(diskLbl);
+            y += diskLbl.PreferredHeight;
+
+            Label cacheLbl = new Label
+            {
+                AutoSize = true,
+                Font = font,
+                Location = new Point(x, y),
+                Text = "Кеш серверний: обчислення...",
+                ForeColor = lblHint.ForeColor
+            };
+            Controls.Add(cacheLbl);
+            _extraInfoLabels.Add(cacheLbl);
+
+            RefreshServerCacheSizeAsync(cacheLbl);
+        }
+
+        private static string GetUptimeText()
+        {
+            try
+            {
+                TimeSpan up = TimeSpan.FromMilliseconds(Kernel32.GetTickCount64());
+                if (up.Days > 0) return string.Format("{0} дн {1:00}:{2:00}", up.Days, up.Hours, up.Minutes);
+                return string.Format("{0:00}:{1:00}:{2:00}", up.Hours, up.Minutes, up.Seconds);
+            }
+            catch
+            {
+                return "невідомо";
+            }
+        }
+
+        private static string GetDiskUsageText()
+        {
+            try
+            {
+                DriveInfo drive = new DriveInfo("C");
+                if (!drive.IsReady) return "недоступно";
+
+                const double gb = 1024.0 * 1024 * 1024;
+                double totalGb = drive.TotalSize / gb;
+                double usedGb = (drive.TotalSize - drive.AvailableFreeSpace) / gb;
+                double pct = drive.TotalSize > 0 ? (usedGb / totalGb * 100.0) : 0;
+                return string.Format("{0:0.#} / {1:0.#} ГБ ({2:0}%)", usedGb, totalGb, pct);
+            }
+            catch
+            {
+                return "недоступно";
+            }
+        }
+
+        private static string FormatBytes(long bytes)
+        {
+            const double gb = 1024.0 * 1024 * 1024;
+            const double mb = 1024.0 * 1024;
+            if (bytes >= gb) return string.Format("{0:0.#} ГБ", bytes / gb);
+            return string.Format("{0:0.#} МБ", bytes / mb);
+        }
+
+        private void RefreshServerCacheSizeAsync(Label targetLabel)
+        {
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                long totalBytes = 0;
+                bool any = false;
+
+                Dictionary<string, ServiceControllerStatus?> statuses = ServerCacheCleanup.GetServiceStatuses();
+                foreach (KeyValuePair<string, ServiceControllerStatus?> kv in statuses)
+                {
+                    if (!kv.Value.HasValue) continue; // служба не встановлена - її кеш не рахуємо
+
+                    string path = ServerCacheCleanup.GetSrvInfoPath(kv.Key);
+                    if (string.IsNullOrEmpty(path) || !Directory.Exists(path)) continue;
+                    any = true;
+
+                    try
+                    {
+                        foreach (string file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+                        {
+                            try { totalBytes += new FileInfo(file).Length; }
+                            catch { /* файл міг зникнути під час обходу - пропускаємо */ }
+                        }
+                    }
+                    catch { /* не критично - покажемо те, що встигли порахувати */ }
+                }
+
+                string text = any ? FormatBytes(totalBytes) : "не встановлено";
+
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    BeginInvoke(new Action(delegate { targetLabel.Text = "Кеш серверний: " + text; }));
+                }
+            });
         }
 
         private static string TranslateServiceStatus(ServiceControllerStatus status)
