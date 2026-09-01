@@ -674,7 +674,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.7.5";
+        private const string AppVersion = "1.7.6";
 
         private static readonly string[] MessageTemplates =
         {
@@ -684,8 +684,10 @@ namespace ShadowSessionTool
         };
         private const string UpdateVersionUrl = "https://raw.githubusercontent.com/Pro100NeFarT/ShadowSessionTool/main/version.txt";
         private const string UpdateExeUrl = "https://raw.githubusercontent.com/Pro100NeFarT/ShadowSessionTool/main/ShadowSessionTool.exe";
+        private const string RepoUrl = "https://github.com/Pro100NeFarT/ShadowSessionTool";
 
         private Label lblVersion;
+        private Button btnRepo;
         private Button btnThemeLight;
         private Button btnThemeDark;
         private Button btnThemeBlue;
@@ -775,11 +777,28 @@ namespace ShadowSessionTool
                 // без іконки застосунок все одно працює коректно
             }
 
+            themeToolTip = new ToolTip();
+
+            btnRepo = new Button
+            {
+                Size = new Size(18, 18),
+                Location = new Point(12, 10),
+                FlatStyle = FlatStyle.Flat,
+                Cursor = Cursors.Hand
+            };
+            btnRepo.FlatAppearance.BorderSize = 0;
+            btnRepo.Click += (s, e) =>
+            {
+                try { Process.Start(RepoUrl); }
+                catch { /* немає браузера за замовчуванням чи інша системна помилка - не критично */ }
+            };
+            themeToolTip.SetToolTip(btnRepo, "Відкрити репозиторій на GitHub");
+
             lblVersion = new Label
             {
                 Text = "v" + AppVersion,
                 AutoSize = true,
-                Location = new Point(12, 12),
+                Location = new Point(34, 12),
                 Cursor = Cursors.Hand,
                 Font = new Font("Segoe UI", 8F, FontStyle.Underline)
             };
@@ -788,8 +807,6 @@ namespace ShadowSessionTool
                 if (_pendingUpdateVersion != null) PromptUpdate(_pendingUpdateVersion);
                 else CheckForUpdatesAsync(true);
             };
-
-            themeToolTip = new ToolTip();
 
             btnThemeLight = new Button { Text = "", Size = new Size(20, 20), Location = new Point(868, 9), BackColor = Color.White, FlatStyle = FlatStyle.Flat, Anchor = AnchorStyles.Top | AnchorStyles.Right };
             btnThemeLight.FlatAppearance.BorderColor = Color.Gray;
@@ -1015,6 +1032,7 @@ namespace ShadowSessionTool
             lvSessions.ColumnClick += LvSessions_ColumnClick;
             lvSessions.MouseDown += LvSessions_MouseDown;
 
+            Controls.Add(btnRepo);
             Controls.Add(lblVersion);
             Controls.Add(btnThemeLight);
             Controls.Add(btnThemeDark);
@@ -2783,6 +2801,11 @@ namespace ShadowSessionTool
             btnRefresh.Image = CreateRefreshIcon(controlFore);
             if (oldRefreshIcon != null) oldRefreshIcon.Dispose();
 
+            btnRepo.BackColor = formBack;
+            Image oldRepoIcon = btnRepo.Image;
+            btnRepo.Image = CreateLinkIcon(hintFore);
+            if (oldRepoIcon != null) oldRepoIcon.Dispose();
+
             _currentTheme = theme;
 
             try
@@ -2801,6 +2824,25 @@ namespace ShadowSessionTool
         {
             btn.FlatAppearance.BorderSize = active ? 3 : 1;
             btn.FlatAppearance.BorderColor = active ? activeBorderColor : Color.Gray;
+        }
+
+        private static Bitmap CreateLinkIcon(Color color)
+        {
+            Bitmap bmp = new Bitmap(16, 16);
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.Clear(Color.Transparent);
+                using (Pen pen = new Pen(color, 2f))
+                {
+                    pen.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                    pen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                    g.DrawArc(pen, 1, 5, 7, 7, 90, 180);
+                    g.DrawArc(pen, 8, 4, 7, 7, 270, 180);
+                    g.DrawLine(pen, 5, 8, 11, 8);
+                }
+            }
+            return bmp;
         }
 
         private static Bitmap CreateRefreshIcon(Color color)
