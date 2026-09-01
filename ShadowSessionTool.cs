@@ -159,6 +159,18 @@ namespace ShadowSessionTool
             { "BAF Server Agent (x86-64)", @"C:\Program Files\BAF\srvinfo" }
         };
 
+        private static readonly Dictionary<string, string> ServiceAdminConsolePaths = new Dictionary<string, string>
+        {
+            { "1C:Enterprise 8.3 Server Agent (x86-64)", @"C:\Program Files\1cv8\common\1CV8 Servers (x86-64).msc" },
+            { "BAF Server Agent (x86-64)", @"C:\Program Files\BAF\common\BAF Servers (x86-64).msc" }
+        };
+
+        internal static string GetAdminConsolePath(string serviceName)
+        {
+            string path;
+            return ServiceAdminConsolePaths.TryGetValue(serviceName, out path) ? path : null;
+        }
+
         private static readonly Regex GuidRegex = new Regex(
             "^[a-f0-9]{8}-([a-f0-9]{4}-){3}[a-f0-9]{12}$", RegexOptions.IgnoreCase);
 
@@ -650,7 +662,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.7.3";
+        private const string AppVersion = "1.7.4";
 
         private static readonly string[] MessageTemplates =
         {
@@ -818,7 +830,7 @@ namespace ShadowSessionTool
             ToolStripMenuItem miCancelScheduleServerCleanup = new ToolStripMenuItem("Скасувати заплановане");
             miCancelScheduleServerCleanup.Click += MiCancelScheduledCleanup_Click;
 
-            ToolStripMenuItem miOpenAdminConsole = new ToolStripMenuItem("Адміністрування серверів 1С...");
+            ToolStripMenuItem miOpenAdminConsole = new ToolStripMenuItem("Адміністрування серверів 1С/BAF...");
             miOpenAdminConsole.Click += MiOpenAdminConsole_Click;
 
             serverCacheMenu = new ContextMenuStrip();
@@ -1786,16 +1798,45 @@ namespace ShadowSessionTool
 
         private void MiOpenAdminConsole_Click(object sender, EventArgs e)
         {
-            OpenAdminConsole();
+            Dictionary<string, ServiceControllerStatus?> statuses = ServerCacheCleanup.GetServiceStatuses();
+            List<string> opened = new List<string>();
+            List<string> missing = new List<string>();
+
+            foreach (KeyValuePair<string, ServiceControllerStatus?> kv in statuses)
+            {
+                if (!kv.Value.HasValue) continue; // служба не встановлена на цьому сервері - консоль теж не шукаємо
+
+                string path = ServerCacheCleanup.GetAdminConsolePath(kv.Key);
+                if (string.IsNullOrEmpty(path) || !File.Exists(path))
+                {
+                    missing.Add(string.IsNullOrEmpty(path) ? kv.Key : path);
+                    continue;
+                }
+
+                try
+                {
+                    Process.Start(path);
+                    opened.Add(path);
+                }
+                catch (Exception ex)
+                {
+                    missing.Add(path + " (" + ex.Message + ")");
+                }
+            }
+
+            if (opened.Count == 0)
+            {
+                string detail = missing.Count > 0 ? string.Join("\n", missing.ToArray()) : "Жодна відома служба 1С/BAF не встановлена на цьому сервері.";
+                MessageBox.Show(this, "Не вдалося відкрити консоль адміністрування:\n" + detail, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
-        private void OpenAdminConsole()
+        private void OpenAdminConsoleFor(string serviceName)
         {
-            const string path = @"C:\Program Files\1cv8\common\1CV8 Servers (x86-64).msc";
-
-            if (!File.Exists(path))
+            string path = ServerCacheCleanup.GetAdminConsolePath(serviceName);
+            if (string.IsNullOrEmpty(path) || !File.Exists(path))
             {
-                MessageBox.Show(this, "Файл консолі не знайдено:\n" + path, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(this, "Файл консолі не знайдено:\n" + (path ?? serviceName), "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
 
@@ -1834,25 +1875,10 @@ namespace ShadowSessionTool
         private void MiStopServices_Click(object sender, EventArgs e)
         {
             DialogResult confirm = MessageBox.Show(this,
-                "Це зупинить служби сервера 1С/BAF (без очищення кешу). 1С стане недоступним для ВСІХ користувачів сервера, " +
-                "доки служби не буде запущено знову.\n\n" +
-                "Усім активним сеансам буде надіслано попередження і 30-секундний відлік перед початком. Продовжити?",
+                "Це відразу зупинить служби сервера 1С/BAF (без очищення кешу). 1С стане недоступним для ВСІХ користувачів сервера, " +
+                "доки служби не буде запущено знову. Продовжити?",
                 "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (confirm != DialogResult.Yes) return;
-
-            List<int> ids = new List<int>();
-            foreach (RdpSession s in _allSessions)
-            {
-                int id;
-                if (int.TryParse(s.Id, out id) && id != _ownSessionId) ids.Add(id);
-            }
-
-            if (ids.Count > 0)
-            {
-                SendMessageToSessions(ids, "Через 30 секунд розпочнеться технічне обслуговування сервера 1С/BAF. Будь ласка, збережіть роботу.");
-            }
-
-            if (ShowCountdownDialog(30)) return;
 
             btnServerCache.Enabled = false;
             Cursor = Cursors.WaitCursor;
@@ -1867,7 +1893,6 @@ namespace ShadowSessionTool
                     {
                         Cursor = Cursors.Default;
                         btnServerCache.Enabled = true;
-                        if (ids.Count > 0) SendMessageToSessions(ids, "Технічне обслуговування завершено.");
                         ShowServiceActionResult(result, "Зупинка служб 1С/BAF", false);
                         RefreshServiceStatusLabels();
                     }));
@@ -1878,25 +1903,10 @@ namespace ShadowSessionTool
         private void MiRestartServices_Click(object sender, EventArgs e)
         {
             DialogResult confirm = MessageBox.Show(this,
-                "Це перезапустить служби сервера 1С/BAF (без очищення кешу). 1С стане недоступним для ВСІХ користувачів сервера " +
-                "на деякий час.\n\n" +
-                "Усім активним сеансам буде надіслано попередження і 30-секундний відлік перед початком. Продовжити?",
+                "Це відразу перезапустить служби сервера 1С/BAF (без очищення кешу). 1С стане недоступним для ВСІХ користувачів сервера " +
+                "на деякий час. Продовжити?",
                 "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (confirm != DialogResult.Yes) return;
-
-            List<int> ids = new List<int>();
-            foreach (RdpSession s in _allSessions)
-            {
-                int id;
-                if (int.TryParse(s.Id, out id) && id != _ownSessionId) ids.Add(id);
-            }
-
-            if (ids.Count > 0)
-            {
-                SendMessageToSessions(ids, "Через 30 секунд розпочнеться технічне обслуговування сервера 1С/BAF. Будь ласка, збережіть роботу.");
-            }
-
-            if (ShowCountdownDialog(30)) return;
 
             btnServerCache.Enabled = false;
             Cursor = Cursors.WaitCursor;
@@ -1911,7 +1921,6 @@ namespace ShadowSessionTool
                     {
                         Cursor = Cursors.Default;
                         btnServerCache.Enabled = true;
-                        if (ids.Count > 0) SendMessageToSessions(ids, "Можна працювати.");
                         ShowServiceActionResult(result, "Перезапуск служб 1С/BAF", false);
                         RefreshServiceStatusLabels();
                     }));
@@ -3301,7 +3310,8 @@ namespace ShadowSessionTool
                     Text = text,
                     ForeColor = color
                 };
-                lbl.Click += (s, e) => OpenAdminConsole();
+                string capturedSvcName = kv.Key;
+                lbl.Click += (s, e) => OpenAdminConsoleFor(capturedSvcName);
                 Controls.Add(lbl);
                 _serviceStatusLabels.Add(lbl);
                 y += lbl.PreferredHeight;
