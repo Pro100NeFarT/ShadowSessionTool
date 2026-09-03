@@ -674,7 +674,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.7.6";
+        private const string AppVersion = "1.7.7";
 
         private static readonly string[] MessageTemplates =
         {
@@ -1602,22 +1602,54 @@ namespace ShadowSessionTool
                 return;
             }
 
-            List<IbaseSection> toDelete = ShowIbaseTreeDialog(
+            bool addToSelf;
+            List<IbaseSection> picked = ShowIbaseTreeDialog(
                 string.Format("Список баз 1С — {0}", userName),
                 sections,
                 "Видалити",
-                "Позначте застарілі записи (або теки) для видалення зі списку баз користувача:");
-            if (toDelete == null || toDelete.Count == 0) return;
+                "Позначте бази (або теки). \"Видалити\" прибирає їх зі списку користувача; \"Прописати собі\" додає обрані бази у ваш власний список.",
+                "Прописати собі",
+                out addToSelf);
+            if (picked == null || picked.Count == 0) return;
+
+            if (addToSelf)
+            {
+                List<IbaseSection> dbsToAdd = new List<IbaseSection>();
+                foreach (IbaseSection s in picked)
+                {
+                    if (s.IsDatabase) dbsToAdd.Add(s);
+                }
+
+                if (dbsToAdd.Count == 0)
+                {
+                    MessageBox.Show(this, "Не вибрано жодної бази (самі теки не прописуються).", "Інформація", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                string myPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "1C", "1CEStart", "ibases.v8i");
+                try
+                {
+                    IbaseFile.AddResult r = IbaseFile.AddDatabases(myPath, dbsToAdd, sections);
+                    MessageBox.Show(this,
+                        string.Format("Додано {0}, пропущено (вже є у вашому списку) {1}.", r.Added, r.Skipped),
+                        "Прописано собі", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, "Не вдалося зберегти зміни: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                return;
+            }
 
             DialogResult confirmDelete = MessageBox.Show(this,
                 string.Format("Видалити {0} запис(ів) зі списку баз користувача \"{1}\"?\n\nЦе прибирає їх лише зі стартового списку 1С, самі бази даних не видаляються.",
-                    toDelete.Count, userName),
+                    picked.Count, userName),
                 "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (confirmDelete != DialogResult.Yes) return;
 
             try
             {
-                IbaseFile.DeleteSections(path, toDelete);
+                IbaseFile.DeleteSections(path, picked);
                 MessageBox.Show(this, "Видалено.", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
@@ -1628,6 +1660,16 @@ namespace ShadowSessionTool
 
         private List<IbaseSection> ShowIbaseTreeDialog(string title, List<IbaseSection> sections, string actionButtonText, string hintText)
         {
+            bool secondActionClicked;
+            return ShowIbaseTreeDialog(title, sections, actionButtonText, hintText, null, out secondActionClicked);
+        }
+
+        private List<IbaseSection> ShowIbaseTreeDialog(string title, List<IbaseSection> sections, string actionButtonText, string hintText,
+            string secondActionButtonText, out bool secondActionClicked)
+        {
+            secondActionClicked = false;
+            bool hasSecond = !string.IsNullOrEmpty(secondActionButtonText);
+
             using (Form dlg = new Form())
             {
                 dlg.Text = title;
@@ -1636,15 +1678,16 @@ namespace ShadowSessionTool
                 dlg.MinimizeBox = false;
                 dlg.MaximizeBox = false;
                 dlg.ShowInTaskbar = false;
-                dlg.ClientSize = new Size(420, 480);
-                dlg.MinimumSize = new Size(340, 300);
+                int dlgWidth = hasSecond ? 460 : 420;
+                dlg.ClientSize = new Size(dlgWidth, 480);
+                dlg.MinimumSize = new Size(hasSecond ? 380 : 340, 300);
                 dlg.Font = Font;
                 dlg.BackColor = BackColor;
 
                 Label lblHintDlg = new Label
                 {
                     AutoSize = true,
-                    MaximumSize = new Size(396, 0),
+                    MaximumSize = new Size(dlgWidth - 24, 0),
                     Location = new Point(12, 10),
                     ForeColor = lblHint.ForeColor,
                     Text = hintText
@@ -1654,7 +1697,7 @@ namespace ShadowSessionTool
                 {
                     CheckBoxes = true,
                     Location = new Point(12, 40),
-                    Size = new Size(396, 376),
+                    Size = new Size(dlgWidth - 24, 376),
                     Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
                     BackColor = txtSearch.BackColor,
                     ForeColor = txtSearch.ForeColor
@@ -1668,12 +1711,49 @@ namespace ShadowSessionTool
                 tree.ExpandAll();
                 tree.AfterCheck += IbaseTree_AfterCheck;
 
+                Button cancel = new Button
+                {
+                    Text = "Скасувати",
+                    DialogResult = DialogResult.Cancel,
+                    Size = new Size(84, 28),
+                    Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
+                };
+                cancel.Location = new Point(dlgWidth - 12 - cancel.Width, 428);
+                cancel.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+
+                Button second = null;
+                int okWidth = 90;
+                int okX;
+                if (hasSecond)
+                {
+                    second = new Button
+                    {
+                        Text = secondActionButtonText,
+                        DialogResult = DialogResult.Yes,
+                        Size = new Size(130, 28),
+                        Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
+                        FlatStyle = btnDisconnect.FlatStyle,
+                        BackColor = btnDisconnect.BackColor,
+                        ForeColor = btnDisconnect.ForeColor
+                    };
+                    second.Location = new Point(cancel.Location.X - 8 - second.Width, 428);
+                    second.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+                    okX = second.Location.X - 8 - okWidth;
+                }
+                else
+                {
+                    okX = cancel.Location.X - 8 - okWidth;
+                }
+
                 Button ok = new Button
                 {
                     Text = actionButtonText,
                     DialogResult = DialogResult.OK,
-                    Location = new Point(228, 428),
-                    Size = new Size(90, 28),
+                    Location = new Point(okX, 428),
+                    Size = new Size(okWidth, 28),
                     Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
                     FlatStyle = btnDisconnect.FlatStyle,
                     BackColor = btnDisconnect.BackColor,
@@ -1681,27 +1761,17 @@ namespace ShadowSessionTool
                 };
                 ok.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
 
-                Button cancel = new Button
-                {
-                    Text = "Скасувати",
-                    DialogResult = DialogResult.Cancel,
-                    Location = new Point(324, 428),
-                    Size = new Size(84, 28),
-                    Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
-                    FlatStyle = btnDisconnect.FlatStyle,
-                    BackColor = btnDisconnect.BackColor,
-                    ForeColor = btnDisconnect.ForeColor
-                };
-                cancel.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
-
                 dlg.Controls.Add(lblHintDlg);
                 dlg.Controls.Add(tree);
                 dlg.Controls.Add(ok);
+                if (second != null) dlg.Controls.Add(second);
                 dlg.Controls.Add(cancel);
                 dlg.AcceptButton = ok;
                 dlg.CancelButton = cancel;
 
-                if (dlg.ShowDialog(this) != DialogResult.OK) return null;
+                DialogResult dr = dlg.ShowDialog(this);
+                if (dr != DialogResult.OK && dr != DialogResult.Yes) return null;
+                secondActionClicked = (dr == DialogResult.Yes);
 
                 List<IbaseSection> selected = new List<IbaseSection>();
                 foreach (KeyValuePair<TreeNode, IbaseSection> kv in nodeMap)
