@@ -10,6 +10,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.ServiceProcess;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -456,6 +457,279 @@ namespace ShadowSessionTool
         }
     }
 
+    internal struct PasswordPolicy
+    {
+        public int MinLength;
+        public bool ComplexityRequired;
+    }
+
+    internal class UserCredential
+    {
+        public string Login;
+        public string Password;
+    }
+
+    internal class CreateUsersResult
+    {
+        public readonly List<UserCredential> Created = new List<UserCredential>();
+        public readonly List<string> Errors = new List<string>();
+    }
+
+    internal static class UserProvisioning
+    {
+        internal static bool TryDetectDomain()
+        {
+            try
+            {
+                using (PrincipalContext ctx = new PrincipalContext(ContextType.Domain)) { return true; }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        internal static PasswordPolicy GetPolicy(bool domain, string domainDnsName)
+        {
+            // розумний дефолт, якщо політику з якоїсь причини прочитати не вдалось
+            PasswordPolicy policy = new PasswordPolicy { MinLength = 7, ComplexityRequired = true };
+
+            try
+            {
+                if (domain)
+                {
+                    using (DirectoryEntry rootDse = new DirectoryEntry("LDAP://RootDSE"))
+                    {
+                        string defaultNamingContext = (string)rootDse.Properties["defaultNamingContext"].Value;
+                        using (DirectoryEntry domainRoot = new DirectoryEntry("LDAP://" + defaultNamingContext))
+                        {
+                            object minLenObj = domainRoot.Properties["minPwdLength"].Value;
+                            object pwdPropsObj = domainRoot.Properties["pwdProperties"].Value;
+                            if (minLenObj != null) policy.MinLength = Convert.ToInt32(minLenObj);
+                            if (pwdPropsObj != null) policy.ComplexityRequired = (Convert.ToInt32(pwdPropsObj) & 0x1) != 0;
+                        }
+                    }
+                }
+                else
+                {
+                    string tempFile = Path.Combine(Path.GetTempPath(), "ssit_secpol_" + Guid.NewGuid().ToString("N") + ".inf");
+                    try
+                    {
+                        int exitCode = MainForm.RunHidden("secedit.exe",
+                            string.Format("/export /cfg \"{0}\" /areas SECURITYPOLICY /quiet", tempFile));
+
+                        if (exitCode == 0 && File.Exists(tempFile))
+                        {
+                            bool inSystemAccess = false;
+                            foreach (string raw in File.ReadAllLines(tempFile))
+                            {
+                                string line = raw.Trim();
+                                if (line.Length == 0) continue;
+
+                                if (line[0] == '[' && line[line.Length - 1] == ']')
+                                {
+                                    inSystemAccess = string.Equals(line, "[System Access]", StringComparison.OrdinalIgnoreCase);
+                                    continue;
+                                }
+                                if (!inSystemAccess) continue;
+
+                                int eq = line.IndexOf('=');
+                                if (eq <= 0) continue;
+                                string key = line.Substring(0, eq).Trim();
+                                string value = line.Substring(eq + 1).Trim();
+
+                                if (string.Equals(key, "MinimumPasswordLength", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    int v;
+                                    if (int.TryParse(value, out v)) policy.MinLength = v;
+                                }
+                                else if (string.Equals(key, "PasswordComplexity", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    policy.ComplexityRequired = value == "1";
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        try { if (File.Exists(tempFile)) File.Delete(tempFile); }
+                        catch { /* не критично - тимчасовий файл, ОС приберете самостійно */ }
+                    }
+                }
+            }
+            catch
+            {
+                // немає прав/довіри до домену тощо - лишаємо розумний дефолт вище
+            }
+
+            return policy;
+        }
+
+        internal static int FindNextNumber(bool domain, string domainDnsName, string baseName)
+        {
+            int maxFound = 0;
+            try
+            {
+                using (PrincipalContext ctx = domain
+                    ? (string.IsNullOrEmpty(domainDnsName) ? new PrincipalContext(ContextType.Domain) : new PrincipalContext(ContextType.Domain, domainDnsName))
+                    : new PrincipalContext(ContextType.Machine))
+                using (UserPrincipal qbe = new UserPrincipal(ctx))
+                {
+                    qbe.SamAccountName = baseName + "*";
+                    using (PrincipalSearcher searcher = new PrincipalSearcher(qbe))
+                    {
+                        Regex pattern = new Regex("^" + Regex.Escape(baseName) + @"(\d+)$", RegexOptions.IgnoreCase);
+                        foreach (Principal p in searcher.FindAll())
+                        {
+                            using (p)
+                            {
+                                Match m = pattern.Match(p.SamAccountName ?? "");
+                                if (!m.Success) continue;
+                                int n;
+                                if (int.TryParse(m.Groups[1].Value, out n) && n > maxFound) maxFound = n;
+                            }
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // немає прав/довіри тощо - повертаємо консервативний дефолт (почати з 1)
+            }
+            return maxFound + 1;
+        }
+
+        private const string LowerChars = "abcdefghijkmnpqrstuvwxyz";
+        private const string UpperChars = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+        private const string DigitChars = "23456789";
+        private const string SpecialChars = "!@#$%^&*-_=+";
+
+        internal static string GeneratePassword(PasswordPolicy policy)
+        {
+            int length = Math.Max(policy.MinLength, 12);
+            List<char> chars = new List<char>();
+
+            using (RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider())
+            {
+                if (policy.ComplexityRequired)
+                {
+                    chars.Add(RandomChar(rng, LowerChars));
+                    chars.Add(RandomChar(rng, UpperChars));
+                    chars.Add(RandomChar(rng, DigitChars));
+                    chars.Add(RandomChar(rng, SpecialChars));
+                }
+
+                string all = policy.ComplexityRequired
+                    ? (LowerChars + UpperChars + DigitChars + SpecialChars)
+                    : (LowerChars + UpperChars + DigitChars);
+
+                while (chars.Count < length) chars.Add(RandomChar(rng, all));
+
+                for (int i = chars.Count - 1; i > 0; i--)
+                {
+                    int j = RandomInt(rng, i + 1);
+                    char tmp = chars[i]; chars[i] = chars[j]; chars[j] = tmp;
+                }
+            }
+
+            return new string(chars.ToArray());
+        }
+
+        private static char RandomChar(RNGCryptoServiceProvider rng, string alphabet)
+        {
+            return alphabet[RandomInt(rng, alphabet.Length)];
+        }
+
+        private static int RandomInt(RNGCryptoServiceProvider rng, int exclusiveMax)
+        {
+            byte[] buf = new byte[4];
+            rng.GetBytes(buf);
+            int value = BitConverter.ToInt32(buf, 0) & int.MaxValue;
+            return value % exclusiveMax;
+        }
+
+        internal static string ValidatePassword(string password, PasswordPolicy policy)
+        {
+            if (string.IsNullOrEmpty(password)) return "Пароль не може бути порожнім.";
+            if (password.Length < policy.MinLength)
+                return string.Format("Пароль закороткий (мінімум {0} символів за політикою).", policy.MinLength);
+
+            if (policy.ComplexityRequired)
+            {
+                int categories = 0;
+                if (Regex.IsMatch(password, "[a-z]")) categories++;
+                if (Regex.IsMatch(password, "[A-Z]")) categories++;
+                if (Regex.IsMatch(password, "[0-9]")) categories++;
+                if (Regex.IsMatch(password, @"[^a-zA-Z0-9]")) categories++;
+                if (categories < 3)
+                    return "Пароль не відповідає вимогам складності (потрібні символи з 3 із 4 категорій: великі й малі літери, цифри, спецсимволи).";
+            }
+
+            return null;
+        }
+
+        internal static CreateUsersResult CreateUsers(bool domain, string domainDnsName, List<UserCredential> accounts)
+        {
+            CreateUsersResult result = new CreateUsersResult();
+
+            foreach (UserCredential account in accounts)
+            {
+                try
+                {
+                    using (PrincipalContext ctx = domain
+                        ? (string.IsNullOrEmpty(domainDnsName) ? new PrincipalContext(ContextType.Domain) : new PrincipalContext(ContextType.Domain, domainDnsName))
+                        : new PrincipalContext(ContextType.Machine))
+                    using (UserPrincipal user = new UserPrincipal(ctx))
+                    {
+                        user.SamAccountName = account.Login;
+                        user.Name = account.Login;
+                        user.Enabled = true;
+                        user.SetPassword(account.Password);
+                        user.Save();
+                    }
+                    result.Created.Add(account);
+                }
+                catch (Exception ex)
+                {
+                    result.Errors.Add(account.Login + ": " + ex.Message);
+                }
+            }
+
+            return result;
+        }
+
+        internal static void SaveCredentialsCsv(string path, List<UserCredential> accounts)
+        {
+            List<string> lines = new List<string> { "Login;Password" };
+            foreach (UserCredential a in accounts) lines.Add(a.Login + ";" + a.Password);
+            File.WriteAllLines(path, lines.ToArray(), new UTF8Encoding(false));
+        }
+
+        internal static List<UserCredential> LoadCredentialsCsv(string path)
+        {
+            List<UserCredential> result = new List<UserCredential>();
+            string[] lines = File.ReadAllLines(path, Encoding.UTF8);
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i].Trim();
+                if (line.Length == 0) continue;
+                if (i == 0 && line.StartsWith("Login", StringComparison.OrdinalIgnoreCase)) continue;
+
+                int sep = line.IndexOf(';');
+                if (sep <= 0 || sep == line.Length - 1) continue;
+
+                result.Add(new UserCredential
+                {
+                    Login = line.Substring(0, sep).Trim(),
+                    Password = line.Substring(sep + 1).Trim()
+                });
+            }
+
+            return result;
+        }
+    }
+
     internal class IbaseSection
     {
         public string Name;
@@ -674,7 +948,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.7.7";
+        private const string AppVersion = "1.8.0";
 
         private static readonly string[] MessageTemplates =
         {
@@ -702,6 +976,8 @@ namespace ShadowSessionTool
         private ContextMenuStrip rebootMenu;
         private Button btnServerCache;
         private ContextMenuStrip serverCacheMenu;
+        private Button btnUsers;
+        private ContextMenuStrip usersMenu;
         private Panel pnlIndicator;
         private Label lblStatus;
         private Button btnEnablePolicy;
@@ -877,6 +1153,22 @@ namespace ShadowSessionTool
 
             btnServerCache.Click += (s, e) => serverCacheMenu.Show(btnServerCache, new Point(0, btnServerCache.Height));
 
+            btnUsers = new Button
+            {
+                Text = "Користувачі ▾",
+                Size = new Size(btnW, btnH),
+                Location = new Point(colB, 74),
+                Anchor = AnchorStyles.Top | AnchorStyles.Right
+            };
+
+            ToolStripMenuItem miCreateUsers = new ToolStripMenuItem("Створити користувачів...");
+            miCreateUsers.Click += (s, e) => ShowCreateUsersDialog();
+
+            usersMenu = new ContextMenuStrip();
+            usersMenu.Items.Add(miCreateUsers);
+
+            btnUsers.Click += (s, e) => usersMenu.Show(btnUsers, new Point(0, btnUsers.Height));
+
             btnReboot = new Button
             {
                 Text = "Перезавантаження ▾",
@@ -1040,6 +1332,7 @@ namespace ShadowSessionTool
             Controls.Add(lblSelect);
             Controls.Add(btnRefresh);
             Controls.Add(btnServerCache);
+            Controls.Add(btnUsers);
             Controls.Add(pnlIndicator);
             Controls.Add(lblStatus);
             Controls.Add(btnEnablePolicy);
@@ -1658,6 +1951,404 @@ namespace ShadowSessionTool
             }
         }
 
+        private void ShowCreateUsersDialog()
+        {
+            using (Form dlg = new Form())
+            {
+                dlg.Text = "Створити користувачів";
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.MinimizeBox = false;
+                dlg.MaximizeBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.ClientSize = new Size(480, 446);
+                dlg.Font = Font;
+                dlg.BackColor = BackColor;
+
+                bool domainAvailable = UserProvisioning.TryDetectDomain();
+
+                Panel pnlScenario = new Panel { Location = new Point(12, 10), Size = new Size(440, 50), BackColor = BackColor };
+                RadioButton rbLocal = new RadioButton
+                {
+                    Text = "Сервер без домену (локальні користувачі)",
+                    AutoSize = true,
+                    Location = new Point(0, 0),
+                    ForeColor = lblSelect.ForeColor,
+                    Checked = !domainAvailable
+                };
+                RadioButton rbDomain = new RadioButton
+                {
+                    Text = "Сервер — контролер домену",
+                    AutoSize = true,
+                    Location = new Point(0, 24),
+                    ForeColor = lblSelect.ForeColor,
+                    Checked = domainAvailable
+                };
+                pnlScenario.Controls.Add(rbLocal);
+                pnlScenario.Controls.Add(rbDomain);
+
+                Label lblBaseName = new Label { AutoSize = true, Location = new Point(12, 72), ForeColor = lblSelect.ForeColor, Text = "Базове ім'я:" };
+                TextBox txtBaseName = new TextBox
+                {
+                    Location = new Point(190, 69),
+                    Size = new Size(150, 23),
+                    Text = "User",
+                    BackColor = txtSearch.BackColor,
+                    ForeColor = txtSearch.ForeColor
+                };
+
+                Label lblStart = new Label { AutoSize = true, Location = new Point(12, 102), ForeColor = lblSelect.ForeColor, Text = "Початковий номер:" };
+                NumericUpDown numStart = new NumericUpDown { Location = new Point(190, 99), Size = new Size(70, 23), Minimum = 1, Maximum = 100000, Value = 1 };
+                Button btnRefreshNumber = new Button
+                {
+                    Text = "Оновити",
+                    Location = new Point(268, 99),
+                    Size = new Size(90, 23),
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
+                };
+                btnRefreshNumber.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+
+                Label lblCount = new Label { AutoSize = true, Location = new Point(12, 134), ForeColor = lblSelect.ForeColor, Text = "Кількість користувачів:" };
+                NumericUpDown numCount = new NumericUpDown { Location = new Point(190, 131), Size = new Size(70, 23), Minimum = 1, Maximum = 1000, Value = 1 };
+
+                Label lblPolicy = new Label
+                {
+                    AutoSize = true,
+                    MaximumSize = new Size(456, 0),
+                    Location = new Point(12, 166),
+                    ForeColor = lblHint.ForeColor,
+                    Text = "Політика паролів: визначення..."
+                };
+
+                Panel pnlPasswordMode = new Panel { Location = new Point(12, 206), Size = new Size(440, 90), BackColor = BackColor };
+                RadioButton rbSamePassword = new RadioButton
+                {
+                    Text = "Однаковий пароль для всіх:",
+                    AutoSize = true,
+                    Location = new Point(0, 0),
+                    ForeColor = lblSelect.ForeColor,
+                    Checked = true
+                };
+                TextBox txtSamePassword = new TextBox
+                {
+                    Location = new Point(20, 24),
+                    Size = new Size(200, 23),
+                    PasswordChar = '●',
+                    BackColor = txtSearch.BackColor,
+                    ForeColor = txtSearch.ForeColor
+                };
+                RadioButton rbGenerate = new RadioButton
+                {
+                    Text = "Згенерувати паролі автоматично (відповідно до політики)",
+                    AutoSize = true,
+                    Location = new Point(0, 54),
+                    ForeColor = lblSelect.ForeColor
+                };
+                pnlPasswordMode.Controls.Add(rbSamePassword);
+                pnlPasswordMode.Controls.Add(txtSamePassword);
+                pnlPasswordMode.Controls.Add(rbGenerate);
+
+                Button btnLoadFile = new Button
+                {
+                    Text = "Завантажити з файлу...",
+                    Location = new Point(12, 306),
+                    Size = new Size(200, 26),
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
+                };
+                btnLoadFile.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+
+                Label lblLoaded = new Label
+                {
+                    AutoSize = true,
+                    MaximumSize = new Size(246, 0),
+                    Location = new Point(222, 312),
+                    ForeColor = lblHint.ForeColor,
+                    Text = ""
+                };
+
+                Button ok = new Button
+                {
+                    Text = "Створити",
+                    Location = new Point(298, 404),
+                    Size = new Size(90, 28),
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
+                };
+                ok.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+
+                Button cancel = new Button
+                {
+                    Text = "Скасувати",
+                    Location = new Point(396, 404),
+                    Size = new Size(72, 28),
+                    DialogResult = DialogResult.Cancel,
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
+                };
+                cancel.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+
+                List<UserCredential> loadedCredentials = null;
+                PasswordPolicy currentPolicy = new PasswordPolicy { MinLength = 7, ComplexityRequired = true };
+
+                Action<bool> setGeneratorControlsEnabled = delegate(bool enabled)
+                {
+                    txtBaseName.Enabled = enabled;
+                    numStart.Enabled = enabled;
+                    btnRefreshNumber.Enabled = enabled;
+                    numCount.Enabled = enabled;
+                    rbSamePassword.Enabled = enabled;
+                    txtSamePassword.Enabled = enabled && rbSamePassword.Checked;
+                    rbGenerate.Enabled = enabled;
+                };
+
+                Action refreshPolicyAndNumber = delegate
+                {
+                    bool domain = rbDomain.Checked;
+                    string baseName = txtBaseName.Text.Trim();
+                    lblPolicy.Text = "Політика паролів: визначення...";
+                    Cursor = Cursors.WaitCursor;
+
+                    System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                    {
+                        PasswordPolicy policy = UserProvisioning.GetPolicy(domain, null);
+                        int nextNumber = UserProvisioning.FindNextNumber(domain, null, baseName);
+
+                        if (IsHandleCreated && !IsDisposed)
+                        {
+                            BeginInvoke(new Action(delegate
+                            {
+                                Cursor = Cursors.Default;
+                                currentPolicy = policy;
+                                lblPolicy.Text = string.Format("Політика паролів: мінімум {0} символів, складність {1}.",
+                                    policy.MinLength, policy.ComplexityRequired ? "потрібна" : "не вимагається");
+                                numStart.Value = Math.Min(numStart.Maximum, (decimal)nextNumber);
+                            }));
+                        }
+                    });
+                };
+
+                rbLocal.CheckedChanged += (s, e) => { if (rbLocal.Checked) refreshPolicyAndNumber(); };
+                rbDomain.CheckedChanged += (s, e) => { if (rbDomain.Checked) refreshPolicyAndNumber(); };
+                btnRefreshNumber.Click += (s, e) => refreshPolicyAndNumber();
+                rbSamePassword.CheckedChanged += (s, e) => { txtSamePassword.Enabled = rbSamePassword.Checked && txtBaseName.Enabled; };
+
+                btnLoadFile.Click += (s, e) =>
+                {
+                    using (OpenFileDialog ofd = new OpenFileDialog())
+                    {
+                        ofd.Filter = "CSV файли (*.csv)|*.csv|Усі файли (*.*)|*.*";
+                        if (ofd.ShowDialog(dlg) != DialogResult.OK) return;
+
+                        try
+                        {
+                            List<UserCredential> loaded = UserProvisioning.LoadCredentialsCsv(ofd.FileName);
+                            if (loaded.Count == 0)
+                            {
+                                MessageBox.Show(dlg, "У файлі не знайдено жодного запису у форматі \"Логін;Пароль\".", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                                return;
+                            }
+                            loadedCredentials = loaded;
+                            lblLoaded.Text = string.Format("Завантажено: {0} запис(ів) з файлу.", loaded.Count);
+                            setGeneratorControlsEnabled(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            MessageBox.Show(dlg, "Не вдалося прочитати файл: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
+                    }
+                };
+
+                ok.Click += (s, e) =>
+                {
+                    bool domain = rbDomain.Checked;
+                    List<UserCredential> toCreate;
+
+                    if (loadedCredentials != null)
+                    {
+                        toCreate = loadedCredentials;
+                    }
+                    else
+                    {
+                        string baseName = txtBaseName.Text.Trim();
+                        if (baseName.Length == 0)
+                        {
+                            MessageBox.Show(dlg, "Вкажіть базове ім'я користувача.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return;
+                        }
+
+                        int start = (int)numStart.Value;
+                        int count = (int)numCount.Value;
+
+                        string sharedPassword = null;
+                        if (rbSamePassword.Checked)
+                        {
+                            sharedPassword = txtSamePassword.Text;
+                            string pwdError = UserProvisioning.ValidatePassword(sharedPassword, currentPolicy);
+                            if (pwdError != null)
+                            {
+                                MessageBox.Show(dlg, pwdError, "Пароль не відповідає політиці", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                                return;
+                            }
+                        }
+
+                        toCreate = new List<UserCredential>();
+                        for (int i = 0; i < count; i++)
+                        {
+                            string login = baseName + (start + i).ToString();
+                            string password = rbSamePassword.Checked ? sharedPassword : UserProvisioning.GeneratePassword(currentPolicy);
+                            toCreate.Add(new UserCredential { Login = login, Password = password });
+                        }
+                    }
+
+                    List<string> previewLogins = new List<string>();
+                    for (int i = 0; i < Math.Min(5, toCreate.Count); i++) previewLogins.Add(toCreate[i].Login);
+                    string preview = string.Join(", ", previewLogins.ToArray()) + (toCreate.Count > 5 ? ", ..." : "");
+
+                    DialogResult confirm = MessageBox.Show(dlg,
+                        string.Format("Буде створено {0} користувач(ів) ({1}): {2}\n\nПродовжити?",
+                            toCreate.Count, domain ? "у домені" : "локально", preview),
+                        "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                    if (confirm != DialogResult.Yes) return;
+
+                    ok.Enabled = false;
+                    cancel.Enabled = false;
+                    Cursor = Cursors.WaitCursor;
+
+                    List<UserCredential> accounts = toCreate;
+                    System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                    {
+                        CreateUsersResult result = UserProvisioning.CreateUsers(domain, null, accounts);
+
+                        if (IsHandleCreated && !IsDisposed)
+                        {
+                            BeginInvoke(new Action(delegate
+                            {
+                                Cursor = Cursors.Default;
+                                dlg.DialogResult = DialogResult.OK;
+                                dlg.Close();
+                                ShowCreateUsersResult(result);
+                            }));
+                        }
+                    });
+                };
+
+                dlg.Controls.Add(pnlScenario);
+                dlg.Controls.Add(lblBaseName);
+                dlg.Controls.Add(txtBaseName);
+                dlg.Controls.Add(lblStart);
+                dlg.Controls.Add(numStart);
+                dlg.Controls.Add(btnRefreshNumber);
+                dlg.Controls.Add(lblCount);
+                dlg.Controls.Add(numCount);
+                dlg.Controls.Add(lblPolicy);
+                dlg.Controls.Add(pnlPasswordMode);
+                dlg.Controls.Add(btnLoadFile);
+                dlg.Controls.Add(lblLoaded);
+                dlg.Controls.Add(ok);
+                dlg.Controls.Add(cancel);
+                dlg.CancelButton = cancel;
+
+                refreshPolicyAndNumber();
+
+                dlg.ShowDialog(this);
+            }
+        }
+
+        private void ShowCreateUsersResult(CreateUsersResult result)
+        {
+            using (Form dlg = new Form())
+            {
+                dlg.Text = "Результат створення користувачів";
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.MinimizeBox = false;
+                dlg.MaximizeBox = false;
+                dlg.ShowInTaskbar = false;
+                dlg.ClientSize = new Size(420, 360);
+                dlg.Font = Font;
+                dlg.BackColor = BackColor;
+
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine(string.Format("Створено: {0}", result.Created.Count));
+                foreach (UserCredential c in result.Created) sb.AppendLine("  " + c.Login);
+                if (result.Errors.Count > 0)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("Помилки:");
+                    foreach (string err in result.Errors) sb.AppendLine("  " + err);
+                }
+
+                TextBox txt = new TextBox
+                {
+                    Multiline = true,
+                    ReadOnly = true,
+                    ScrollBars = ScrollBars.Vertical,
+                    Location = new Point(12, 12),
+                    Size = new Size(396, 296),
+                    Text = sb.ToString(),
+                    BackColor = txtSearch.BackColor,
+                    ForeColor = txtSearch.ForeColor
+                };
+
+                Button btnSave = new Button
+                {
+                    Text = "Зберегти у файл...",
+                    Location = new Point(12, 320),
+                    Size = new Size(150, 28),
+                    Enabled = result.Created.Count > 0,
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
+                };
+                btnSave.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+                btnSave.Click += (s, e) =>
+                {
+                    using (SaveFileDialog sfd = new SaveFileDialog())
+                    {
+                        sfd.Filter = "CSV файли (*.csv)|*.csv";
+                        sfd.FileName = "users.csv";
+                        if (sfd.ShowDialog(dlg) != DialogResult.OK) return;
+
+                        try
+                        {
+                            UserProvisioning.SaveCredentialsCsv(sfd.FileName, result.Created);
+                            MessageBox.Show(dlg, "Збережено.", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                        catch (Exception ex)
+                        {
+                            MessageBox.Show(dlg, "Не вдалося зберегти файл: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
+                    }
+                };
+
+                Button close = new Button
+                {
+                    Text = "Закрити",
+                    Location = new Point(318, 320),
+                    Size = new Size(90, 28),
+                    DialogResult = DialogResult.OK,
+                    FlatStyle = btnDisconnect.FlatStyle,
+                    BackColor = btnDisconnect.BackColor,
+                    ForeColor = btnDisconnect.ForeColor
+                };
+                close.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+
+                dlg.Controls.Add(txt);
+                dlg.Controls.Add(btnSave);
+                dlg.Controls.Add(close);
+                dlg.AcceptButton = close;
+                dlg.CancelButton = close;
+
+                dlg.ShowDialog(this);
+            }
+        }
+
         private List<IbaseSection> ShowIbaseTreeDialog(string title, List<IbaseSection> sections, string actionButtonText, string hintText)
         {
             bool secondActionClicked;
@@ -2176,7 +2867,7 @@ namespace ShadowSessionTool
             }
         }
 
-        private static int RunHidden(string exe, string args)
+        internal static int RunHidden(string exe, string args)
         {
             try
             {
@@ -2854,7 +3545,7 @@ namespace ShadowSessionTool
             lvSessions.BackColor = listBack;
             lvSessions.ForeColor = listFore;
 
-            Button[] buttons = { btnRefresh, btnServerCache, btnEnablePolicy, btnDisconnect, btnDisconnectAll, btnReboot };
+            Button[] buttons = { btnRefresh, btnServerCache, btnUsers, btnEnablePolicy, btnDisconnect, btnDisconnectAll, btnReboot };
             foreach (Button btn in buttons)
             {
                 btn.FlatStyle = btnStyle;
