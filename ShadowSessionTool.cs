@@ -668,7 +668,11 @@ namespace ShadowSessionTool
             return null;
         }
 
-        internal static CreateUsersResult CreateUsers(bool domain, string domainDnsName, List<UserCredential> accounts)
+        // Вбудовані групи шукаємо за SID, а не за іменем - імена залежать від мови ОС
+        internal const string SidUsers = "S-1-5-32-545";
+        internal const string SidRemoteDesktopUsers = "S-1-5-32-555";
+
+        internal static CreateUsersResult CreateUsers(bool domain, string domainDnsName, List<UserCredential> accounts, List<string> groupSids)
         {
             CreateUsersResult result = new CreateUsersResult();
 
@@ -686,6 +690,27 @@ namespace ShadowSessionTool
                         user.Enabled = true;
                         user.SetPassword(account.Password);
                         user.Save();
+
+                        foreach (string sid in groupSids)
+                        {
+                            try
+                            {
+                                using (GroupPrincipal group = GroupPrincipal.FindByIdentity(ctx, IdentityType.Sid, sid))
+                                {
+                                    if (group == null)
+                                    {
+                                        result.Errors.Add(account.Login + ": групу " + sid + " не знайдено");
+                                        continue;
+                                    }
+                                    group.Members.Add(user);
+                                    group.Save();
+                                }
+                            }
+                            catch (Exception gex)
+                            {
+                                result.Errors.Add(account.Login + ": не додано до групи " + sid + " - " + gex.Message);
+                            }
+                        }
                     }
                     result.Created.Add(account);
                 }
@@ -948,7 +973,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.8.0";
+        private const string AppVersion = "1.8.1";
 
         private static readonly string[] MessageTemplates =
         {
@@ -2070,6 +2095,24 @@ namespace ShadowSessionTool
                     Text = ""
                 };
 
+                Label lblGroups = new Label { AutoSize = true, Location = new Point(12, 348), ForeColor = lblSelect.ForeColor, Text = "Додати до груп:" };
+                CheckBox chkUsers = new CheckBox
+                {
+                    Text = "Users (Користувачі)",
+                    AutoSize = true,
+                    Location = new Point(130, 346),
+                    ForeColor = lblSelect.ForeColor,
+                    Checked = true
+                };
+                CheckBox chkRdp = new CheckBox
+                {
+                    Text = "Remote Desktop Users",
+                    AutoSize = true,
+                    Location = new Point(290, 346),
+                    ForeColor = lblSelect.ForeColor,
+                    Checked = true
+                };
+
                 Button ok = new Button
                 {
                     Text = "Створити",
@@ -2221,9 +2264,12 @@ namespace ShadowSessionTool
                     Cursor = Cursors.WaitCursor;
 
                     List<UserCredential> accounts = toCreate;
+                    List<string> groupSids = new List<string>();
+                    if (chkUsers.Checked) groupSids.Add(UserProvisioning.SidUsers);
+                    if (chkRdp.Checked) groupSids.Add(UserProvisioning.SidRemoteDesktopUsers);
                     System.Threading.ThreadPool.QueueUserWorkItem(delegate
                     {
-                        CreateUsersResult result = UserProvisioning.CreateUsers(domain, null, accounts);
+                        CreateUsersResult result = UserProvisioning.CreateUsers(domain, null, accounts, groupSids);
 
                         if (IsHandleCreated && !IsDisposed)
                         {
@@ -2250,6 +2296,9 @@ namespace ShadowSessionTool
                 dlg.Controls.Add(pnlPasswordMode);
                 dlg.Controls.Add(btnLoadFile);
                 dlg.Controls.Add(lblLoaded);
+                dlg.Controls.Add(lblGroups);
+                dlg.Controls.Add(chkUsers);
+                dlg.Controls.Add(chkRdp);
                 dlg.Controls.Add(ok);
                 dlg.Controls.Add(cancel);
                 dlg.CancelButton = cancel;
