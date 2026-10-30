@@ -755,6 +755,184 @@ namespace ShadowSessionTool
         }
     }
 
+    internal class ActivityRow
+    {
+        public string Login;
+        public string FullName;
+        public string Description;
+        public bool IsDomain;
+        public string DomainName;
+        public bool Enabled;
+        public DateTime? LastLogon;
+        public DateTime? LastRdp;
+
+        public DateTime? Latest
+        {
+            get
+            {
+                if (LastLogon.HasValue && LastRdp.HasValue) return LastLogon.Value > LastRdp.Value ? LastLogon : LastRdp;
+                return LastLogon.HasValue ? LastLogon : LastRdp;
+            }
+        }
+
+        public int? DaysAgo
+        {
+            get
+            {
+                DateTime? latest = Latest;
+                if (!latest.HasValue) return null;
+                return (int)Math.Max(0, (DateTime.Now - latest.Value).TotalDays);
+            }
+        }
+    }
+
+    internal static class ActivityReport
+    {
+        // Повертає учасників Remote Desktop Users (за SID, тож незалежно від мови ОС) з датами останньої активності
+        internal static List<ActivityRow> Build(out string warning)
+        {
+            List<string> warnings = new List<string>();
+            List<ActivityRow> rows = new List<ActivityRow>();
+            int skippedGroups = 0;
+
+            try
+            {
+                using (PrincipalContext ctx = new PrincipalContext(ContextType.Machine))
+                using (GroupPrincipal group = GroupPrincipal.FindByIdentity(ctx, IdentityType.Sid, UserProvisioning.SidRemoteDesktopUsers))
+                {
+                    if (group == null)
+                    {
+                        warnings.Add("Групу Remote Desktop Users не знайдено.");
+                    }
+                    else
+                    {
+                        foreach (Principal p in group.GetMembers(false))
+                        {
+                            using (p)
+                            {
+                                UserPrincipal u = p as UserPrincipal;
+                                if (u == null) { skippedGroups++; continue; }
+
+                                ActivityRow row = new ActivityRow();
+                                row.Login = u.SamAccountName ?? u.Name;
+                                row.FullName = u.DisplayName ?? "";
+                                row.Description = u.Description ?? "";
+                                row.IsDomain = u.Context.ContextType == ContextType.Domain;
+                                row.DomainName = u.Context.Name;
+                                row.Enabled = u.Enabled ?? true;
+                                try { row.LastLogon = u.LastLogon; } catch { }
+                                rows.Add(row);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                warnings.Add("Не вдалося повністю прочитати групу: " + ex.Message);
+            }
+
+            if (skippedGroups > 0) warnings.Add(string.Format("Вкладені групи ({0}) не розгортались.", skippedGroups));
+
+            try
+            {
+                Dictionary<string, DateTime> byFull;
+                Dictionary<string, DateTime> byName;
+                ReadLastRdp(out byFull, out byName);
+
+                string machine = Environment.MachineName.ToLowerInvariant();
+                foreach (ActivityRow row in rows)
+                {
+                    string login = row.Login.ToLowerInvariant();
+                    string dom = row.IsDomain ? (row.DomainName ?? "").ToLowerInvariant() : machine;
+                    DateTime dt;
+                    if (byFull.TryGetValue(dom + "\\" + login, out dt) || byName.TryGetValue(login, out dt)) row.LastRdp = dt;
+                }
+            }
+            catch (Exception ex)
+            {
+                warnings.Add("Журнал RDP-підключень недоступний: " + ex.Message);
+            }
+
+            warning = string.Join(" ", warnings.ToArray());
+            return rows;
+        }
+
+        private static void ReadLastRdp(out Dictionary<string, DateTime> byFull, out Dictionary<string, DateTime> byName)
+        {
+            byFull = new Dictionary<string, DateTime>();
+            byName = new Dictionary<string, DateTime>();
+
+            // події 21 (вхід) і 25 (повторне підключення), від найновіших до найстаріших
+            ProcessStartInfo psi = new ProcessStartInfo("wevtutil.exe",
+                "qe Microsoft-Windows-TerminalServices-LocalSessionManager/Operational \"/q:*[System[(EventID=21 or EventID=25)]]\" /rd:true /f:xml /c:50000")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                StandardOutputEncoding = Encoding.UTF8
+            };
+
+            string xml;
+            using (Process p = Process.Start(psi))
+            {
+                xml = p.StandardOutput.ReadToEnd();
+                p.WaitForExit(30000);
+            }
+
+            Regex ev = new Regex("<Event\\b.*?</Event>", RegexOptions.Singleline);
+            Regex time = new Regex("SystemTime=['\"]([^'\"]+)['\"]");
+            Regex user = new Regex("<User>([^<]*)</User>");
+
+            foreach (Match m in ev.Matches(xml))
+            {
+                Match tm = time.Match(m.Value);
+                Match um = user.Match(m.Value);
+                if (!tm.Success || !um.Success) continue;
+
+                DateTime when;
+                if (!DateTime.TryParse(tm.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out when)) continue;
+                when = when.ToLocalTime();
+
+                string full = System.Net.WebUtility.HtmlDecode(um.Groups[1].Value).Trim().ToLowerInvariant();
+                if (full.Length == 0) continue;
+                int slash = full.IndexOf('\\');
+                string name = slash >= 0 ? full.Substring(slash + 1) : full;
+
+                if (!byFull.ContainsKey(full)) byFull[full] = when;
+                if (!byName.ContainsKey(name)) byName[name] = when;
+            }
+        }
+
+        private static PrincipalContext OpenContext(ActivityRow row)
+        {
+            return row.IsDomain ? new PrincipalContext(ContextType.Domain, row.DomainName) : new PrincipalContext(ContextType.Machine);
+        }
+
+        internal static void SetPassword(ActivityRow row, string password)
+        {
+            using (PrincipalContext ctx = OpenContext(row))
+            using (UserPrincipal u = UserPrincipal.FindByIdentity(ctx, IdentityType.SamAccountName, row.Login))
+            {
+                if (u == null) throw new InvalidOperationException("Користувача не знайдено.");
+                u.SetPassword(password);
+                u.Save();
+            }
+        }
+
+        internal static void SetDescription(ActivityRow row, string description)
+        {
+            using (PrincipalContext ctx = OpenContext(row))
+            using (UserPrincipal u = UserPrincipal.FindByIdentity(ctx, IdentityType.SamAccountName, row.Login))
+            {
+                if (u == null) throw new InvalidOperationException("Користувача не знайдено.");
+                u.Description = description;
+                u.Save();
+            }
+        }
+    }
+
     internal class IbaseSection
     {
         public string Name;
@@ -973,7 +1151,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.8.1";
+        private const string AppVersion = "1.8.2";
 
         private static readonly string[] MessageTemplates =
         {
@@ -1189,8 +1367,12 @@ namespace ShadowSessionTool
             ToolStripMenuItem miCreateUsers = new ToolStripMenuItem("Створити користувачів...");
             miCreateUsers.Click += (s, e) => ShowCreateUsersDialog();
 
+            ToolStripMenuItem miActivityReport = new ToolStripMenuItem("Звіт активності користувачів...");
+            miActivityReport.Click += (s, e) => ShowActivityReportDialog();
+
             usersMenu = new ContextMenuStrip();
             usersMenu.Items.Add(miCreateUsers);
+            usersMenu.Items.Add(miActivityReport);
 
             btnUsers.Click += (s, e) => usersMenu.Show(btnUsers, new Point(0, btnUsers.Height));
 
@@ -1973,6 +2155,292 @@ namespace ShadowSessionTool
             catch (Exception ex)
             {
                 MessageBox.Show(this, "Не вдалося зберегти зміни: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void ShowActivityReportDialog()
+        {
+            using (Form dlg = new Form())
+            {
+                dlg.Text = "Активність користувачів (Remote Desktop Users)";
+                dlg.FormBorderStyle = FormBorderStyle.Sizable;
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.MinimizeBox = false;
+                dlg.MaximizeBox = true;
+                dlg.ShowInTaskbar = false;
+                dlg.ClientSize = new Size(960, 540);
+                dlg.MinimumSize = new Size(760, 380);
+                dlg.Font = Font;
+                dlg.BackColor = BackColor;
+
+                CheckBox chkFilter = new CheckBox
+                {
+                    Text = "Лише ті, хто не заходив понад (днів):",
+                    AutoSize = true,
+                    Location = new Point(12, 12),
+                    ForeColor = lblSelect.ForeColor
+                };
+                NumericUpDown numDays = new NumericUpDown { Location = new Point(300, 9), Size = new Size(70, 23), Minimum = 1, Maximum = 3650, Value = 30 };
+                Label lblInfo = new Label { AutoSize = true, Location = new Point(390, 12), ForeColor = lblHint.ForeColor, Text = "" };
+
+                ListView lv = new ListView
+                {
+                    View = View.Details,
+                    FullRowSelect = true,
+                    GridLines = true,
+                    MultiSelect = false,
+                    Location = new Point(12, 40),
+                    Size = new Size(936, 450),
+                    Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+                    BackColor = txtSearch.BackColor,
+                    ForeColor = txtSearch.ForeColor
+                };
+                lv.Columns.Add("Користувач", 140);
+                lv.Columns.Add("Повне ім'я", 150);
+                lv.Columns.Add("Опис", 190);
+                lv.Columns.Add("Акаунт", 80);
+                lv.Columns.Add("Останній вхід (акаунт)", 140);
+                lv.Columns.Add("Останнє RDP (журнал)", 140);
+                lv.Columns.Add("Днів тому", 80);
+
+                int sortCol = -1;
+                SortOrder sortOrder = SortOrder.None;
+                lv.ColumnClick += (s, e) =>
+                {
+                    if (e.Column == sortCol) sortOrder = sortOrder == SortOrder.Ascending ? SortOrder.Descending : SortOrder.Ascending;
+                    else { sortCol = e.Column; sortOrder = SortOrder.Ascending; }
+                    lv.ListViewItemSorter = new ListViewItemComparer(sortCol, sortOrder);
+                    lv.Sort();
+                };
+
+                Func<string, Button> makeButton = delegate(string text)
+                {
+                    Button b = new Button
+                    {
+                        Text = text,
+                        Size = new Size(150, 28),
+                        Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
+                        FlatStyle = btnDisconnect.FlatStyle,
+                        BackColor = btnDisconnect.BackColor,
+                        ForeColor = btnDisconnect.ForeColor
+                    };
+                    b.FlatAppearance.BorderColor = btnDisconnect.FlatAppearance.BorderColor;
+                    return b;
+                };
+
+                Button btnRefreshRep = makeButton("Оновити");
+                btnRefreshRep.Location = new Point(12, 500);
+                Button btnPassword = makeButton("Новий пароль...");
+                btnPassword.Location = new Point(170, 500);
+                Button btnDescr = makeButton("Змінити опис...");
+                btnDescr.Location = new Point(328, 500);
+                Button btnExport = makeButton("Експорт у CSV...");
+                btnExport.Location = new Point(486, 500);
+                Button btnClose = makeButton("Закрити");
+                btnClose.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+                btnClose.Location = new Point(798, 500);
+                btnClose.Size = new Size(150, 28);
+                btnClose.DialogResult = DialogResult.Cancel;
+
+                List<ActivityRow> allRows = new List<ActivityRow>();
+
+                Action fillList = delegate
+                {
+                    lv.BeginUpdate();
+                    lv.Items.Clear();
+
+                    List<ActivityRow> shown = new List<ActivityRow>();
+                    foreach (ActivityRow r in allRows)
+                    {
+                        if (chkFilter.Checked)
+                        {
+                            int? d = r.DaysAgo;
+                            if (d.HasValue && d.Value <= (int)numDays.Value) continue;
+                        }
+                        shown.Add(r);
+                    }
+
+                    // спершу ті, хто не заходив ніколи, далі - від найдавніших
+                    shown.Sort(delegate(ActivityRow a, ActivityRow b)
+                    {
+                        int da = a.DaysAgo.HasValue ? a.DaysAgo.Value : int.MaxValue;
+                        int db = b.DaysAgo.HasValue ? b.DaysAgo.Value : int.MaxValue;
+                        return db.CompareTo(da);
+                    });
+
+                    foreach (ActivityRow r in shown)
+                    {
+                        ListViewItem item = new ListViewItem(r.IsDomain ? (r.DomainName + "\\" + r.Login) : r.Login);
+                        item.SubItems.Add(r.FullName);
+                        item.SubItems.Add(r.Description);
+                        item.SubItems.Add(r.Enabled ? "активний" : "вимкнено");
+                        item.SubItems.Add(r.LastLogon.HasValue ? r.LastLogon.Value.ToString("yyyy-MM-dd HH:mm") : "—");
+                        item.SubItems.Add(r.LastRdp.HasValue ? r.LastRdp.Value.ToString("yyyy-MM-dd HH:mm") : "—");
+                        item.SubItems.Add(r.DaysAgo.HasValue ? r.DaysAgo.Value.ToString() : "ніколи");
+                        item.Tag = r;
+                        if (!r.Enabled) item.ForeColor = Color.Gray;
+                        lv.Items.Add(item);
+                    }
+                    lv.EndUpdate();
+                };
+
+                Action load = delegate
+                {
+                    lblInfo.Text = "Завантаження...";
+                    btnRefreshRep.Enabled = false;
+                    Cursor = Cursors.WaitCursor;
+
+                    System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                    {
+                        string warning;
+                        List<ActivityRow> rows = ActivityReport.Build(out warning);
+
+                        if (IsHandleCreated && !IsDisposed && !dlg.IsDisposed)
+                        {
+                            BeginInvoke(new Action(delegate
+                            {
+                                Cursor = Cursors.Default;
+                                btnRefreshRep.Enabled = true;
+                                allRows = rows;
+                                fillList();
+                                lblInfo.Text = string.Format("Користувачів: {0}. {1}", rows.Count, warning);
+                            }));
+                        }
+                    });
+                };
+
+                chkFilter.CheckedChanged += (s, e) => fillList();
+                numDays.ValueChanged += (s, e) => { if (chkFilter.Checked) fillList(); };
+                btnRefreshRep.Click += (s, e) => load();
+
+                Func<ActivityRow> selectedRow = delegate
+                {
+                    if (lv.SelectedItems.Count != 1)
+                    {
+                        MessageBox.Show(dlg, "Виберіть одного користувача.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return null;
+                    }
+                    return (ActivityRow)lv.SelectedItems[0].Tag;
+                };
+
+                btnPassword.Click += (s, e) =>
+                {
+                    ActivityRow row = selectedRow();
+                    if (row == null) return;
+
+                    DialogResult mode = MessageBox.Show(dlg,
+                        string.Format("Новий пароль для \"{0}\".\n\nТак — згенерувати автоматично (за політикою)\nНі — ввести свій\nСкасувати — відмінити", row.Login),
+                        "Новий пароль", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+                    if (mode == DialogResult.Cancel) return;
+
+                    Cursor = Cursors.WaitCursor;
+                    PasswordPolicy policy = UserProvisioning.GetPolicy(row.IsDomain, null);
+                    Cursor = Cursors.Default;
+
+                    string password;
+                    if (mode == DialogResult.Yes)
+                    {
+                        password = UserProvisioning.GeneratePassword(policy);
+                    }
+                    else
+                    {
+                        password = ShowInputDialog(string.Format("Новий пароль для \"{0}\":", row.Login), "Новий пароль", true);
+                        if (password == null) return;
+                        string err = UserProvisioning.ValidatePassword(password, policy);
+                        if (err != null)
+                        {
+                            MessageBox.Show(dlg, err, "Пароль не відповідає політиці", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return;
+                        }
+                    }
+
+                    try
+                    {
+                        ActivityReport.SetPassword(row, password);
+                        if (mode == DialogResult.Yes)
+                        {
+                            CopyToClipboard(row.Login + ";" + password);
+                            MessageBox.Show(dlg, string.Format("Пароль змінено.\n\nЛогін: {0}\nПароль: {1}\n\n(скопійовано в буфер обміну як \"логін;пароль\")", row.Login, password),
+                                "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                        else
+                        {
+                            MessageBox.Show(dlg, "Пароль змінено.", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show(dlg, "Не вдалося змінити пароль: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                };
+
+                btnDescr.Click += (s, e) =>
+                {
+                    ActivityRow row = selectedRow();
+                    if (row == null) return;
+
+                    string text = ShowInputDialog(string.Format("Новий опис для \"{0}\" (зараз: {1}):", row.Login,
+                        string.IsNullOrEmpty(row.Description) ? "порожньо" : row.Description), "Змінити опис");
+                    if (text == null) return;
+
+                    try
+                    {
+                        ActivityReport.SetDescription(row, text);
+                        row.Description = text;
+                        lv.SelectedItems[0].SubItems[2].Text = text;
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show(dlg, "Не вдалося змінити опис: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                };
+
+                btnExport.Click += (s, e) =>
+                {
+                    using (SaveFileDialog sfd = new SaveFileDialog())
+                    {
+                        sfd.Filter = "CSV файли (*.csv)|*.csv";
+                        sfd.FileName = "activity.csv";
+                        if (sfd.ShowDialog(dlg) != DialogResult.OK) return;
+
+                        try
+                        {
+                            Func<string, string> clean = delegate(string v) { return (v ?? "").Replace(";", " ").Replace("\r", " ").Replace("\n", " ").Replace("\"", "'").Trim(); };
+                            List<string> lines = new List<string> { "Login;FullName;Description;Enabled;LastLogon;LastRdp;DaysAgo" };
+                            foreach (ListViewItem item in lv.Items)
+                            {
+                                ActivityRow r = (ActivityRow)item.Tag;
+                                lines.Add(string.Join(";", new string[]
+                                {
+                                    clean(item.Text), clean(r.FullName), clean(r.Description), r.Enabled ? "1" : "0",
+                                    r.LastLogon.HasValue ? r.LastLogon.Value.ToString("yyyy-MM-dd HH:mm") : "",
+                                    r.LastRdp.HasValue ? r.LastRdp.Value.ToString("yyyy-MM-dd HH:mm") : "",
+                                    r.DaysAgo.HasValue ? r.DaysAgo.Value.ToString() : ""
+                                }));
+                            }
+                            File.WriteAllLines(sfd.FileName, lines.ToArray(), new UTF8Encoding(false));
+                            MessageBox.Show(dlg, "Збережено.", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                        catch (Exception ex)
+                        {
+                            MessageBox.Show(dlg, "Не вдалося зберегти файл: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
+                    }
+                };
+
+                dlg.Controls.Add(chkFilter);
+                dlg.Controls.Add(numDays);
+                dlg.Controls.Add(lblInfo);
+                dlg.Controls.Add(lv);
+                dlg.Controls.Add(btnRefreshRep);
+                dlg.Controls.Add(btnPassword);
+                dlg.Controls.Add(btnDescr);
+                dlg.Controls.Add(btnExport);
+                dlg.Controls.Add(btnClose);
+                dlg.CancelButton = btnClose;
+
+                load();
+                dlg.ShowDialog(this);
             }
         }
 
