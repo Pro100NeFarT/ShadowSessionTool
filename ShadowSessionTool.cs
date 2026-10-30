@@ -921,6 +921,17 @@ namespace ShadowSessionTool
             }
         }
 
+        internal static void SetEnabled(ActivityRow row, bool enabled)
+        {
+            using (PrincipalContext ctx = OpenContext(row))
+            using (UserPrincipal u = UserPrincipal.FindByIdentity(ctx, IdentityType.SamAccountName, row.Login))
+            {
+                if (u == null) throw new InvalidOperationException("Користувача не знайдено.");
+                u.Enabled = enabled;
+                u.Save();
+            }
+        }
+
         internal static void SetDescription(ActivityRow row, string description)
         {
             using (PrincipalContext ctx = OpenContext(row))
@@ -1151,7 +1162,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.8.2";
+        private const string AppVersion = "1.8.3";
 
         private static readonly string[] MessageTemplates =
         {
@@ -2181,7 +2192,14 @@ namespace ShadowSessionTool
                     ForeColor = lblSelect.ForeColor
                 };
                 NumericUpDown numDays = new NumericUpDown { Location = new Point(300, 9), Size = new Size(70, 23), Minimum = 1, Maximum = 3650, Value = 30 };
-                Label lblInfo = new Label { AutoSize = true, Location = new Point(390, 12), ForeColor = lblHint.ForeColor, Text = "" };
+                CheckBox chkDisabled = new CheckBox
+                {
+                    Text = "Лише вимкнені акаунти",
+                    AutoSize = true,
+                    Location = new Point(390, 12),
+                    ForeColor = lblSelect.ForeColor
+                };
+                Label lblInfo = new Label { AutoSize = true, Location = new Point(580, 12), ForeColor = lblHint.ForeColor, Text = "" };
 
                 ListView lv = new ListView
                 {
@@ -2236,6 +2254,8 @@ namespace ShadowSessionTool
                 btnDescr.Location = new Point(328, 500);
                 Button btnExport = makeButton("Експорт у CSV...");
                 btnExport.Location = new Point(486, 500);
+                Button btnToggle = makeButton("Вимкн./увімкн. акаунт");
+                btnToggle.Location = new Point(644, 500);
                 Button btnClose = makeButton("Закрити");
                 btnClose.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
                 btnClose.Location = new Point(798, 500);
@@ -2252,6 +2272,7 @@ namespace ShadowSessionTool
                     List<ActivityRow> shown = new List<ActivityRow>();
                     foreach (ActivityRow r in allRows)
                     {
+                        if (chkDisabled.Checked && r.Enabled) continue;
                         if (chkFilter.Checked)
                         {
                             int? d = r.DaysAgo;
@@ -2310,6 +2331,7 @@ namespace ShadowSessionTool
                 };
 
                 chkFilter.CheckedChanged += (s, e) => fillList();
+                chkDisabled.CheckedChanged += (s, e) => fillList();
                 numDays.ValueChanged += (s, e) => { if (chkFilter.Checked) fillList(); };
                 btnRefreshRep.Click += (s, e) => load();
 
@@ -2395,6 +2417,28 @@ namespace ShadowSessionTool
                     }
                 };
 
+                btnToggle.Click += (s, e) =>
+                {
+                    ActivityRow row = selectedRow();
+                    if (row == null) return;
+
+                    bool newState = !row.Enabled;
+                    if (MessageBox.Show(dlg,
+                        string.Format("{0} обліковий запис \"{1}\"?", newState ? "Увімкнути" : "Вимкнути", row.Login),
+                        "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+
+                    try
+                    {
+                        ActivityReport.SetEnabled(row, newState);
+                        row.Enabled = newState;
+                        fillList();
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show(dlg, "Не вдалося змінити стан акаунта: " + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                };
+
                 btnExport.Click += (s, e) =>
                 {
                     using (SaveFileDialog sfd = new SaveFileDialog())
@@ -2430,12 +2474,14 @@ namespace ShadowSessionTool
 
                 dlg.Controls.Add(chkFilter);
                 dlg.Controls.Add(numDays);
+                dlg.Controls.Add(chkDisabled);
                 dlg.Controls.Add(lblInfo);
                 dlg.Controls.Add(lv);
                 dlg.Controls.Add(btnRefreshRep);
                 dlg.Controls.Add(btnPassword);
                 dlg.Controls.Add(btnDescr);
                 dlg.Controls.Add(btnExport);
+                dlg.Controls.Add(btnToggle);
                 dlg.Controls.Add(btnClose);
                 dlg.CancelButton = btnClose;
 
