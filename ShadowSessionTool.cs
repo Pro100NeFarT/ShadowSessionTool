@@ -794,6 +794,7 @@ namespace ShadowSessionTool
             List<string> warnings = new List<string>();
             List<ActivityRow> rows = new List<ActivityRow>();
             int skippedGroups = 0;
+            Dictionary<string, bool> seen = new Dictionary<string, bool>();
 
             try
             {
@@ -812,6 +813,9 @@ namespace ShadowSessionTool
                             {
                                 UserPrincipal u = p as UserPrincipal;
                                 if (u == null) { skippedGroups++; continue; }
+
+                                string key = u.Sid != null ? u.Sid.Value : ((u.Context.Name ?? "") + "\\" + (u.SamAccountName ?? u.Name)).ToLowerInvariant();
+                                if (!seen.ContainsKey(key)) seen[key] = true; else continue;
 
                                 ActivityRow row = new ActivityRow();
                                 row.Login = u.SamAccountName ?? u.Name;
@@ -1162,7 +1166,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.8.3";
+        private const string AppVersion = "1.8.4";
 
         private static readonly string[] MessageTemplates =
         {
