@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -32,6 +32,24 @@ namespace ShadowSessionTool
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+
+            // /copy - лише засіб копіювання профілів (для WinPE, де решта функцій застосунку не потрібна)
+            if (args.Length > 0 && string.Equals(args[0], "/copy", StringComparison.OrdinalIgnoreCase))
+            {
+                RunCopyTool();
+                return;
+            }
+
+            RunMainApp();
+        }
+
+        private static void RunCopyTool()
+        {
+            Application.Run(new ProfileCopyForm());
+        }
+
+        private static void RunMainApp()
+        {
             Application.Run(new MainForm());
         }
     }
@@ -948,6 +966,270 @@ namespace ShadowSessionTool
         }
     }
 
+    internal class ProfileCopyForm : Form
+    {
+        // (назва в інтерфейсі, відносний шлях у профілі, увімкнено за замовчуванням)
+        private static readonly object[][] FolderDefs =
+        {
+            new object[] { "Робочий стіл", "Desktop", true },
+            new object[] { "Документи", "Documents", true },
+            new object[] { "Завантаження", "Downloads", true },
+            new object[] { "Зображення", "Pictures", true },
+            new object[] { "Відео", "Videos", true },
+            new object[] { "Музика", "Music", true },
+            new object[] { "Вибране (Favorites)", "Favorites", true },
+            new object[] { "Контакти", "Contacts", true },
+            new object[] { "1С: список баз (1CEStart)", @"AppData\Roaming\1C\1CEStart", true },
+            new object[] { "Підписи Outlook", @"AppData\Roaming\Microsoft\Signatures", true },
+            new object[] { "Нотатки Sticky Notes", @"AppData\Local\Packages\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe\LocalState", true },
+            new object[] { "Посилання (Links)", "Links", false },
+            new object[] { "Збережені ігри", "Saved Games", false },
+            new object[] { "Пошуки", "Searches", false },
+            new object[] { "Outlook: пошта .pst/.ost (великі файли)", @"AppData\Local\Microsoft\Outlook", false }
+        };
+
+        private static readonly string[] SkipProfiles = { "public", "default", "default user", "all users", "defaultuser0" };
+
+        private ComboBox cmbDrive;
+        private CheckedListBox clbUsers;
+        private CheckedListBox clbFolders;
+        private TextBox txtDest;
+        private TextBox txtLog;
+        private Button btnCopy;
+        private Button btnStop;
+        private Label lblStatus;
+        private volatile bool _cancel;
+        private Process _current;
+
+        internal ProfileCopyForm()
+        {
+            Text = "Копіювання даних користувачів";
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(760, 640);
+            MinimumSize = new Size(700, 560);
+
+            Label lblDrive = new Label { AutoSize = true, Location = new Point(12, 14), Text = "Розділ з Windows:" };
+            cmbDrive = new ComboBox { Location = new Point(140, 10), Size = new Size(400, 23), DropDownStyle = ComboBoxStyle.DropDownList };
+            Button btnRescan = new Button { Text = "Оновити", Location = new Point(550, 9), Size = new Size(90, 25) };
+            cmbDrive.SelectedIndexChanged += (s, e) => LoadUsers();
+            btnRescan.Click += (s, e) => LoadDrives();
+
+            Label lblUsers = new Label { AutoSize = true, Location = new Point(12, 46), Text = "Користувачі:" };
+            clbUsers = new CheckedListBox { Location = new Point(12, 66), Size = new Size(360, 150), CheckOnClick = true };
+            Label lblFolders = new Label { AutoSize = true, Location = new Point(388, 46), Text = "Папки для копіювання:" };
+            clbFolders = new CheckedListBox { Location = new Point(388, 66), Size = new Size(360, 150), CheckOnClick = true, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            foreach (object[] d in FolderDefs) clbFolders.Items.Add(d[0].ToString(), (bool)d[2]);
+
+            Button btnUsersAll = new Button { Text = "Усі", Location = new Point(12, 220), Size = new Size(60, 23) };
+            Button btnUsersNone = new Button { Text = "Жодного", Location = new Point(78, 220), Size = new Size(70, 23) };
+            btnUsersAll.Click += (s, e) => { for (int i = 0; i < clbUsers.Items.Count; i++) clbUsers.SetItemChecked(i, true); };
+            btnUsersNone.Click += (s, e) => { for (int i = 0; i < clbUsers.Items.Count; i++) clbUsers.SetItemChecked(i, false); };
+            Button btnFoldersAll = new Button { Text = "Усі", Location = new Point(388, 220), Size = new Size(60, 23) };
+            Button btnFoldersNone = new Button { Text = "Жодної", Location = new Point(454, 220), Size = new Size(70, 23) };
+            btnFoldersAll.Click += (s, e) => { for (int i = 0; i < clbFolders.Items.Count; i++) clbFolders.SetItemChecked(i, true); };
+            btnFoldersNone.Click += (s, e) => { for (int i = 0; i < clbFolders.Items.Count; i++) clbFolders.SetItemChecked(i, false); };
+
+            Label lblDest = new Label { AutoSize = true, Location = new Point(12, 258), Text = "Куди копіювати:" };
+            txtDest = new TextBox { Location = new Point(140, 254), Size = new Size(500, 23), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            Button btnBrowse = new Button { Text = "Огляд...", Location = new Point(648, 253), Size = new Size(100, 25), Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            btnBrowse.Click += (s, e) =>
+            {
+                try
+                {
+                    using (FolderBrowserDialog fbd = new FolderBrowserDialog())
+                    {
+                        if (fbd.ShowDialog(this) == DialogResult.OK) txtDest.Text = fbd.SelectedPath;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, "Не вдалося відкрити вибір папки, введіть шлях вручну: " + ex.Message, "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            };
+
+            btnCopy = new Button { Text = "Копіювати", Location = new Point(12, 290), Size = new Size(150, 30) };
+            btnStop = new Button { Text = "Зупинити", Location = new Point(170, 290), Size = new Size(120, 30), Enabled = false };
+            lblStatus = new Label { AutoSize = true, Location = new Point(300, 298), Text = "" };
+            btnCopy.Click += (s, e) => StartCopy();
+            btnStop.Click += (s, e) =>
+            {
+                _cancel = true;
+                try { if (_current != null && !_current.HasExited) _current.Kill(); } catch { }
+            };
+
+            txtLog = new TextBox
+            {
+                Location = new Point(12, 330),
+                Size = new Size(736, 298),
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Vertical,
+                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+            };
+
+            Controls.AddRange(new Control[] { lblDrive, cmbDrive, btnRescan, lblUsers, clbUsers, lblFolders, clbFolders,
+                btnUsersAll, btnUsersNone, btnFoldersAll, btnFoldersNone, lblDest, txtDest, btnBrowse, btnCopy, btnStop, lblStatus, txtLog });
+
+            Shown += (s, e) => LoadDrives();
+        }
+
+        private void LoadDrives()
+        {
+            cmbDrive.Items.Clear();
+            foreach (DriveInfo d in DriveInfo.GetDrives())
+            {
+                try
+                {
+                    if (!d.IsReady) continue;
+                    string root = d.RootDirectory.FullName;
+                    if (Directory.Exists(Path.Combine(root, "Users")) && Directory.Exists(Path.Combine(root, @"Windows\System32")))
+                        cmbDrive.Items.Add(root);
+                }
+                catch { }
+            }
+            if (cmbDrive.Items.Count > 0) cmbDrive.SelectedIndex = 0;
+            else
+            {
+                clbUsers.Items.Clear();
+                Log("Розділів із Windows не знайдено.");
+            }
+        }
+
+        private void LoadUsers()
+        {
+            clbUsers.Items.Clear();
+            if (cmbDrive.SelectedItem == null) return;
+            try
+            {
+                string usersDir = Path.Combine(cmbDrive.SelectedItem.ToString(), "Users");
+                foreach (DirectoryInfo di in new DirectoryInfo(usersDir).GetDirectories())
+                {
+                    if (Array.IndexOf(SkipProfiles, di.Name.ToLowerInvariant()) >= 0) continue;
+                    if ((di.Attributes & FileAttributes.ReparsePoint) != 0) continue;
+                    bool looksLikeProfile = File.Exists(Path.Combine(di.FullName, "NTUSER.DAT")) || Directory.Exists(Path.Combine(di.FullName, "Desktop"));
+                    if (!looksLikeProfile) continue;
+                    clbUsers.Items.Add(di.Name, true);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("Не вдалося прочитати профілі: " + ex.Message);
+            }
+        }
+
+        private void Log(string text)
+        {
+            if (InvokeRequired) { BeginInvoke(new Action<string>(Log), text); return; }
+            txtLog.AppendText(text + Environment.NewLine);
+        }
+
+        private void SetBusy(bool busy, string status)
+        {
+            if (InvokeRequired) { BeginInvoke(new Action<bool, string>(SetBusy), busy, status); return; }
+            btnCopy.Enabled = !busy;
+            btnStop.Enabled = busy;
+            lblStatus.Text = status;
+        }
+
+        private void StartCopy()
+        {
+            if (cmbDrive.SelectedItem == null) { MessageBox.Show(this, "Немає розділу з Windows.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            string dest = txtDest.Text.Trim();
+            if (dest.Length == 0) { MessageBox.Show(this, "Вкажіть, куди копіювати.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+
+            string root = cmbDrive.SelectedItem.ToString();
+            List<string> users = new List<string>();
+            foreach (object o in clbUsers.CheckedItems) users.Add(o.ToString());
+            List<string> rels = new List<string>();
+            for (int i = 0; i < clbFolders.Items.Count; i++)
+                if (clbFolders.GetItemChecked(i)) rels.Add((string)FolderDefs[i][1]);
+
+            if (users.Count == 0 || rels.Count == 0) { MessageBox.Show(this, "Виберіть користувачів і папки.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+
+            string fullDest;
+            try { fullDest = Path.GetFullPath(dest); }
+            catch { MessageBox.Show(this, "Некоректний шлях призначення.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+
+            string usersRoot = Path.GetFullPath(Path.Combine(root, "Users")).TrimEnd('\\') + "\\";
+            if ((fullDest.TrimEnd('\\') + "\\").StartsWith(usersRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                MessageBox.Show(this, "Призначення не може бути всередині папки Users джерела.", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (MessageBox.Show(this,
+                string.Format("Скопіювати {0} користувач(ів), {1} папок кожного, у:\n{2}\n\nПродовжити?", users.Count, rels.Count, fullDest),
+                "Підтвердження", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+
+            _cancel = false;
+            SetBusy(true, "Копіювання...");
+            txtLog.Clear();
+
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate { RunCopy(root, users, rels, fullDest); });
+        }
+
+        private void RunCopy(string root, List<string> users, List<string> rels, string fullDest)
+        {
+            int ok = 0, skipped = 0, errors = 0;
+            string robo = Path.Combine(Environment.SystemDirectory, "robocopy.exe");
+            if (!File.Exists(robo)) robo = "robocopy.exe";
+
+            Encoding enc;
+            try { enc = Encoding.GetEncoding(System.Globalization.CultureInfo.CurrentCulture.TextInfo.OEMCodePage); }
+            catch { enc = Encoding.Default; }
+
+            foreach (string user in users)
+            {
+                foreach (string rel in rels)
+                {
+                    if (_cancel) break;
+
+                    string src = Path.Combine(Path.Combine(root, "Users"), Path.Combine(user, rel));
+                    if (!Directory.Exists(src)) { skipped++; continue; }
+
+                    string dst = Path.Combine(Path.Combine(fullDest, user), rel);
+                    Log(string.Format("=== {0}\\{1}", user, rel));
+                    SetBusy(true, user + ": " + rel);
+
+                    string args = string.Format(
+                        "\"{0}\" \"{1}\" /E /B /R:1 /W:1 /XJ /COPY:DAT /DCOPY:DAT /MT:8 /NP /NFL /NDL /NJH /XF desktop.ini Thumbs.db ~$* *.tmp /XD $RECYCLE.BIN \"System Volume Information\"",
+                        src, dst);
+
+                    try
+                    {
+                        ProcessStartInfo psi = new ProcessStartInfo(robo, args)
+                        {
+                            UseShellExecute = false,
+                            CreateNoWindow = true,
+                            RedirectStandardOutput = true,
+                            StandardOutputEncoding = enc
+                        };
+                        using (Process p = Process.Start(psi))
+                        {
+                            _current = p;
+                            p.OutputDataReceived += (s, e) => { if (!string.IsNullOrWhiteSpace(e.Data)) Log(e.Data); };
+                            p.BeginOutputReadLine();
+                            p.WaitForExit();
+                            // robocopy: коди 0-7 - успіх (різні комбінації копіювання), 8+ - помилки
+                            if (p.ExitCode >= 8) errors++; else ok++;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        errors++;
+                        Log("Помилка запуску robocopy: " + ex.Message);
+                    }
+                }
+                if (_cancel) break;
+            }
+
+            _current = null;
+            Log(string.Empty);
+            Log(string.Format("{0}: успішно {1}, пропущено (немає папки) {2}, з помилками {3}.", _cancel ? "ЗУПИНЕНО" : "ГОТОВО", ok, skipped, errors));
+            SetBusy(false, _cancel ? "Зупинено" : "Готово");
+        }
+    }
+
     internal class IbaseSection
     {
         public string Name;
@@ -1166,7 +1448,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.8.4";
+        private const string AppVersion = "1.8.5";
 
         private static readonly string[] MessageTemplates =
         {
@@ -1388,6 +1670,10 @@ namespace ShadowSessionTool
             usersMenu = new ContextMenuStrip();
             usersMenu.Items.Add(miCreateUsers);
             usersMenu.Items.Add(miActivityReport);
+
+            ToolStripMenuItem miCopyData = new ToolStripMenuItem("Копіювання даних користувачів...");
+            miCopyData.Click += (s, e) => { using (ProfileCopyForm f = new ProfileCopyForm()) f.ShowDialog(this); };
+            usersMenu.Items.Add(miCopyData);
 
             btnUsers.Click += (s, e) => usersMenu.Show(btnUsers, new Point(0, btnUsers.Height));
 
