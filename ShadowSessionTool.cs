@@ -1230,6 +1230,53 @@ namespace ShadowSessionTool
         }
     }
 
+    internal static class RequiredUpdate
+    {
+        // build ОС -> (KB, мінімальний номер ревізії UBR, у якій виправлення вже є).
+        // Накопичувальні оновлення включають попередні, тому UBR >= цільового означає "встановлено або новіше".
+        internal class Info
+        {
+            public string Kb;
+            public int MinRevision;
+            public string Build;
+        }
+
+        private static readonly Dictionary<string, Info> ByBuild = new Dictionary<string, Info>
+        {
+            { "20348", new Info { Kb = "KB5129237", MinRevision = 5631, Build = "20348" } }, // Windows Server 2022
+            { "17763", new Info { Kb = "KB5129238", MinRevision = 9247, Build = "17763" } }, // Windows Server 2019
+            { "14393", new Info { Kb = "KB5129239", MinRevision = 9514, Build = "14393" } }  // Windows Server 2016
+        };
+
+        // null - для цієї версії ОС перевірка не застосовується
+        internal static Info Get(out int currentRevision)
+        {
+            currentRevision = 0;
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion"))
+                {
+                    if (key == null) return null;
+                    string build = Convert.ToString(key.GetValue("CurrentBuild"));
+                    object ubr = key.GetValue("UBR");
+                    if (ubr != null) currentRevision = Convert.ToInt32(ubr);
+
+                    Info info;
+                    return ByBuild.TryGetValue(build, out info) ? info : null;
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        internal static string CatalogUrl(string kb)
+        {
+            return "https://www.catalog.update.microsoft.com/Search.aspx?q=" + kb;
+        }
+    }
+
     internal class IbaseSection
     {
         public string Name;
@@ -1448,7 +1495,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.8.5";
+        private const string AppVersion = "1.8.6";
 
         private static readonly string[] MessageTemplates =
         {
@@ -4985,6 +5032,35 @@ namespace ShadowSessionTool
                 Controls.Add(lbl);
                 _serviceStatusLabels.Add(lbl);
                 y += lbl.PreferredHeight;
+            }
+
+            int revision;
+            RequiredUpdate.Info update = RequiredUpdate.Get(out revision);
+            if (update != null)
+            {
+                bool installed = revision >= update.MinRevision;
+                string updText = installed
+                    ? string.Format("Виправлення RDS {0}: встановлено (збірка {1}.{2})", update.Kb, update.Build, revision)
+                    : string.Format("Виправлення RDS {0}: НЕ встановлено (збірка {1}.{2}) - клік, щоб відкрити Microsoft Update Catalog", update.Kb, update.Build, revision);
+
+                Label updLbl = new Label
+                {
+                    AutoSize = true,
+                    MaximumSize = new Size(370, 0),
+                    Font = font,
+                    Cursor = Cursors.Hand,
+                    Location = new Point(x, y + 4),
+                    Text = updText,
+                    ForeColor = installed ? Color.ForestGreen : Color.Firebrick
+                };
+                string url = RequiredUpdate.CatalogUrl(update.Kb);
+                updLbl.Click += (s, e) =>
+                {
+                    try { Process.Start(url); }
+                    catch { /* немає браузера - не критично */ }
+                };
+                Controls.Add(updLbl);
+                _serviceStatusLabels.Add(updLbl);
             }
 
             RefreshExtraInfoLabels();
