@@ -1495,7 +1495,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.8.6";
+        private const string AppVersion = "1.8.7";
 
         private static readonly string[] MessageTemplates =
         {
@@ -1874,6 +1874,7 @@ namespace ShadowSessionTool
             lvSessions.Columns.Add("Ім'я сеансу", 150);
             lvSessions.Columns.Add("1С/BAS", 90);
             lvSessions.Columns.Add("Опис", 160);
+            lvSessions.Columns.Add("Тип облікового запису", 150);
             lvSessions.DoubleClick += (s, e) => BtnConnect_Click(s, e);
             lvSessions.SelectedIndexChanged += (s, e) => UpdateActionButtons();
             lvSessions.ColumnClick += LvSessions_ColumnClick;
@@ -2557,6 +2558,7 @@ namespace ShadowSessionTool
                 lv.Columns.Add("Останній вхід (акаунт)", 140);
                 lv.Columns.Add("Останнє RDP (журнал)", 140);
                 lv.Columns.Add("Днів тому", 80);
+                lv.Columns.Add("Тип", 130);
 
                 int sortCol = -1;
                 SortOrder sortOrder = SortOrder.None;
@@ -2635,6 +2637,7 @@ namespace ShadowSessionTool
                         item.SubItems.Add(r.LastLogon.HasValue ? r.LastLogon.Value.ToString("yyyy-MM-dd HH:mm") : "—");
                         item.SubItems.Add(r.LastRdp.HasValue ? r.LastRdp.Value.ToString("yyyy-MM-dd HH:mm") : "—");
                         item.SubItems.Add(r.DaysAgo.HasValue ? r.DaysAgo.Value.ToString() : "ніколи");
+                        item.SubItems.Add(r.IsDomain ? "Домен: " + r.DomainName : "Локальний");
                         item.Tag = r;
                         if (!r.Enabled) item.ForeColor = Color.Gray;
                         lv.Items.Add(item);
@@ -4635,6 +4638,7 @@ namespace ShadowSessionTool
                 item.SubItems.Add(isOwn ? s.SessionName + " (поточний)" : s.SessionName);
                 item.SubItems.Add(s.OneCCount.ToString());
                 item.SubItems.Add(s.Description);
+                item.SubItems.Add(DescribeAccountType(s.DomainName));
                 lvSessions.Items.Add(item);
             }
 
@@ -4644,6 +4648,14 @@ namespace ShadowSessionTool
             }
 
             UpdateActionButtons();
+        }
+
+        // Локальний - якщо домен сеансу порожній або збігається з іменем сервера, інакше показуємо домен
+        private static string DescribeAccountType(string domainName)
+        {
+            bool isLocal = string.IsNullOrEmpty(domainName) ||
+                string.Equals(domainName, Environment.MachineName, StringComparison.OrdinalIgnoreCase);
+            return isLocal ? "Локальний" : "Домен: " + domainName;
         }
 
         private static string TranslateState(WtsConnectState state)
