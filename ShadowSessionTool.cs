@@ -1277,6 +1277,45 @@ namespace ShadowSessionTool
         }
     }
 
+    internal static class ProfileLocator
+    {
+        // Папка профілю за SID облікового запису (HKLM\...\ProfileList). Якщо локальний і доменний користувачі
+        // мають однакове ім'я, у доменного профіль лежить в C:\Users\<ім'я>.<ДОМЕН>, тож за самим ім'ям шлях визначати не можна.
+        internal static string Find(string userName, string domainName)
+        {
+            int slashIdx = userName.IndexOf('\\');
+            string plain = slashIdx >= 0 ? userName.Substring(slashIdx + 1) : userName;
+            if (slashIdx >= 0 && string.IsNullOrEmpty(domainName)) domainName = userName.Substring(0, slashIdx);
+
+            bool isLocal = string.IsNullOrEmpty(domainName) ||
+                string.Equals(domainName, Environment.MachineName, StringComparison.OrdinalIgnoreCase);
+            string accountDomain = isLocal ? Environment.MachineName : domainName;
+
+            try
+            {
+                System.Security.Principal.NTAccount account = new System.Security.Principal.NTAccount(accountDomain, plain);
+                System.Security.Principal.SecurityIdentifier sid =
+                    (System.Security.Principal.SecurityIdentifier)account.Translate(typeof(System.Security.Principal.SecurityIdentifier));
+
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\" + sid.Value))
+                {
+                    if (key != null)
+                    {
+                        string path = Convert.ToString(key.GetValue("ProfileImagePath"));
+                        if (!string.IsNullOrEmpty(path)) return Environment.ExpandEnvironmentVariables(path);
+                    }
+                }
+            }
+            catch
+            {
+                // не вдалося визначити SID (немає довіри до домену тощо) - спробуємо за іменем нижче
+            }
+
+            string systemDrive = Environment.GetEnvironmentVariable("SystemDrive") + "\\";
+            return Path.Combine(systemDrive, "Users", plain);
+        }
+    }
+
     internal class IbaseSection
     {
         public string Name;
@@ -1304,12 +1343,9 @@ namespace ShadowSessionTool
             "DisableLocalSpeechToText", "DefaultApp", "DefaultVersion", "UseProxy", "WSA"
         };
 
-        internal static string GetPathForUser(string userName)
+        internal static string GetPathForUser(string userName, string domainName)
         {
-            int slashIdx = userName.IndexOf('\\');
-            string plain = slashIdx >= 0 ? userName.Substring(slashIdx + 1) : userName;
-            string systemDrive = Environment.GetEnvironmentVariable("SystemDrive") + "\\";
-            return Path.Combine(systemDrive, "Users", plain, "AppData", "Roaming", "1C", "1CEStart", "ibases.v8i");
+            return Path.Combine(ProfileLocator.Find(userName, domainName), "AppData", "Roaming", "1C", "1CEStart", "ibases.v8i");
         }
 
         internal static List<IbaseSection> Parse(string[] lines)
@@ -1495,7 +1531,7 @@ namespace ShadowSessionTool
         private const int DesiredValue = 2;
         private const string UserRegPath = @"Software\ShadowSessionTool";
 
-        private const string AppVersion = "1.8.7";
+        private const string AppVersion = "1.8.8";
 
         private static readonly string[] MessageTemplates =
         {
@@ -2252,6 +2288,7 @@ namespace ShadowSessionTool
 
             List<int> ids = new List<int>();
             List<string> userNames = new List<string>();
+            List<string> userDomains = new List<string>();
             foreach (ListViewItem item in lvSessions.SelectedItems)
             {
                 int id;
@@ -2259,6 +2296,7 @@ namespace ShadowSessionTool
                 {
                     ids.Add(id);
                     userNames.Add(item.Text);
+                    userDomains.Add(DomainOf(item));
                 }
             }
             if (ids.Count == 0) return;
@@ -2278,11 +2316,12 @@ namespace ShadowSessionTool
             if (processes.Count > 0) System.Threading.Thread.Sleep(1500);
 
             List<string> cacheErrors = new List<string>();
-            foreach (string userName in userNames)
+            for (int ui = 0; ui < userNames.Count; ui++)
             {
+                string userName = userNames[ui];
                 try
                 {
-                    ClearOneCCache(userName);
+                    ClearOneCCache(userName, userDomains[ui]);
                 }
                 catch (Exception ex)
                 {
@@ -2309,13 +2348,9 @@ namespace ShadowSessionTool
         private static readonly string[] OneCVersionFolders = { "1Cv8", "1Cv82" };
         private static readonly string[] OneCCacheFoldersToDelete = { "Config", "ConfigSave", "DBNameCache", "SICache", "vrs-cache" };
 
-        private static void ClearOneCCache(string userName)
+        private static void ClearOneCCache(string userName, string domainName)
         {
-            int slashIdx = userName.IndexOf('\\');
-            string plainUserName = slashIdx >= 0 ? userName.Substring(slashIdx + 1) : userName;
-
-            string systemDrive = Environment.GetEnvironmentVariable("SystemDrive") + "\\";
-            string profileRoot = Path.Combine(systemDrive, "Users", plainUserName);
+            string profileRoot = ProfileLocator.Find(userName, domainName);
 
             string[] roots =
             {
@@ -2351,7 +2386,12 @@ namespace ShadowSessionTool
             if (lvSessions.SelectedItems.Count == 0) return;
 
             List<string> targetUsers = new List<string>();
-            foreach (ListViewItem item in lvSessions.SelectedItems) targetUsers.Add(item.Text);
+            List<string> targetDomains = new List<string>();
+            foreach (ListViewItem item in lvSessions.SelectedItems)
+            {
+                targetUsers.Add(item.Text);
+                targetDomains.Add(DomainOf(item));
+            }
 
             string sourcePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "1C", "1CEStart", "ibases.v8i");
             if (!File.Exists(sourcePath))
@@ -2399,9 +2439,10 @@ namespace ShadowSessionTool
             if (confirmAdd != DialogResult.Yes) return;
 
             StringBuilder summary = new StringBuilder();
-            foreach (string userName in targetUsers)
+            for (int ti = 0; ti < targetUsers.Count; ti++)
             {
-                string targetPath = IbaseFile.GetPathForUser(userName);
+                string userName = targetUsers[ti];
+                string targetPath = IbaseFile.GetPathForUser(userName, targetDomains[ti]);
                 try
                 {
                     IbaseFile.AddResult r = IbaseFile.AddDatabases(targetPath, dbsOnly, sourceSections);
@@ -2425,7 +2466,7 @@ namespace ShadowSessionTool
             }
 
             string userName = lvSessions.SelectedItems[0].Text;
-            string path = IbaseFile.GetPathForUser(userName);
+            string path = IbaseFile.GetPathForUser(userName, DomainOf(lvSessions.SelectedItems[0]));
 
             if (!File.Exists(path))
             {
@@ -4639,6 +4680,7 @@ namespace ShadowSessionTool
                 item.SubItems.Add(s.OneCCount.ToString());
                 item.SubItems.Add(s.Description);
                 item.SubItems.Add(DescribeAccountType(s.DomainName));
+                item.Tag = s;
                 lvSessions.Items.Add(item);
             }
 
@@ -4651,6 +4693,12 @@ namespace ShadowSessionTool
         }
 
         // Локальний - якщо домен сеансу порожній або збігається з іменем сервера, інакше показуємо домен
+        private static string DomainOf(ListViewItem item)
+        {
+            RdpSession s = item.Tag as RdpSession;
+            return s != null ? s.DomainName : "";
+        }
+
         private static string DescribeAccountType(string domainName)
         {
             bool isLocal = string.IsNullOrEmpty(domainName) ||
